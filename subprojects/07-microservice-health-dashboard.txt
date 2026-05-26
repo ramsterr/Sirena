@@ -1,0 +1,195 @@
+# Project 7: Microservice Health Dashboard — Build Reference
+
+> This document is the canonical reference for building a real-time microservice health dashboard. It is a standalone, shippable project that contributes to Phase 4 of the SRE Root Cause Analysis Tool. Use this as the source of truth when prompting for implementation help.
+
+---
+
+## Meta-Structure: How to Read This Document
+
+This project contains these sections:
+
+- **Real Objective** — What you are *actually* trying to accomplish, stated in plain English.
+- **Tool Objective** — What the software must do at the end. This is the acceptance test.
+- **What You Must Understand Before Coding** — Concepts, their internals, and why they matter.
+- **What to Study and Where** — Specific resources, specific sections, specific things to extract.
+- **What to Code** — Each component, its purpose, inputs, outputs, internals, and verification.
+- **How the Pieces Connect** — Data flow showing how components connect.
+- **Understanding Checkpoints** — Concrete things you should be able to explain before moving on.
+- **Common Mistakes** — What people get wrong and how to avoid it.
+- **Ship Criteria** — What makes this project ready to publish and share.
+
+---
+
+## Real Objective
+
+You are building a web dashboard that shows the real-time health of all services in a Kubernetes cluster. Think of it like a hospital's patient monitoring board — it shows which services are healthy, which are degraded, and which are critical, all at a glance. This is the most immediately useful tool for any team running microservices, and it can be built quickly with Streamlit.
+
+## Tool Objective
+
+By the end of this project, the dashboard must:
+1. Display all services in the cluster with their current health status
+2. Show key metrics (CPU, memory, latency, error rate) per service
+3. Color-code services by health (green = healthy, yellow = degraded, red = critical)
+4. Auto-refresh every 30 seconds
+5. Allow filtering by namespace and service
+6. Show a summary: total services, healthy count, degraded count, critical count
+
+## What You Must Understand Before Coding
+
+### Concept 1: Health Status Thresholds
+
+A service's health status is determined by its metrics:
+- **Healthy (green):** All metrics within normal range (z-score < 2)
+- **Degraded (yellow):** One or more metrics mildly anomalous (2 ≤ z-score < 3)
+- **Critical (red):** One or more metrics strongly anomalous (z-score ≥ 3)
+
+**Why this matters:** The dashboard's primary value is at-a-glance visibility. Color coding makes it instantly clear which services need attention.
+
+**Self-check:** A service has CPU z-score = 1.5, latency z-score = 3.2, error rate z-score = 0.8. What's its status? Answer: Critical (latency z-score ≥ 3).
+
+## What to Study and Where
+
+| What | Where | What to Extract |
+|---|---|---|
+| Streamlit basics | [Streamlit docs](https://docs.streamlit.io/) | `st.metric`, `st.dataframe`, `st.line_chart`, `st.columns`, auto-refresh with `st.rerun()`. |
+| Prometheus API | [Prometheus API docs](https://prometheus.io/docs/prometheus/latest/querying/api/) | Instant queries for current metric values. |
+| Kubernetes API | [Kubernetes Python client](https://github.com/kubernetes-client/python) | Listing services and pods in the cluster. |
+
+## What to Code
+
+### Component 7.1: Health Status Calculator
+
+**Purpose:** Determine the health status of each service based on current metrics.
+
+**Input:** Current metric values per service, baseline statistics
+**Output:** Dictionary mapping `service_name → {status, z_scores, metrics}`
+
+**What to understand when coding this:**
+
+```python
+def calculate_health(metrics: Dict[str, float],
+                     baselines: Dict[str, Dict[str, float]]) -> Dict:
+    z_scores = {}
+    for metric_name, value in metrics.items():
+        baseline = baselines[metric_name]
+        std = baseline.get('std', 0.001)  # avoid division by zero
+        z_scores[metric_name] = abs(value - baseline['mean']) / std
+
+    max_z = max(z_scores.values())
+    if max_z >= 3.0:
+        status = "critical"
+    elif max_z >= 2.0:
+        status = "degraded"
+    else:
+        status = "healthy"
+
+    return {
+        "status": status,
+        "z_scores": z_scores,
+        "metrics": metrics,
+        "max_z": max_z
+    }
+```
+
+### Component 7.2: Streamlit Dashboard
+
+**Purpose:** Render the health dashboard in a web browser.
+
+**Key layout:**
+```
+┌────────────────────────────────────────────────────────────┐
+│  Microservice Health Dashboard          [Auto-refresh: 30s]│
+├────────────────────────────────────────────────────────────┤
+│  Summary: 11 services | 🟢 8 healthy | 🟡 2 degraded | 🔴 1│
+├────────────────────────────────────────────────────────────┤
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐                   │
+│  │ frontend  │ │ cart     │ │ payment  │                   │
+│  │ 🟢        │ │ 🟡       │ │ 🔴       │                   │
+│  │ CPU: 45%  │ │ CPU: 78% │ │ CPU: 92% │                   │
+│  │ Lat: 200ms│ │ Lat: 800ms│ │ Lat: 2s  │                   │
+│  └──────────┘ └──────────┘ └──────────┘                   │
+│  ... (more services)                                       │
+├────────────────────────────────────────────────────────────┤
+│  Metric Trends (click a service to see details)            │
+│  [Line chart showing CPU, latency, error rate over time]   │
+└────────────────────────────────────────────────────────────┘
+```
+
+**What to understand when coding this:**
+
+Use `st.columns` to display service cards in a grid. Use `st.metric` for individual metric values. Use `st.line_chart` for metric trends. Use `st.rerun()` for auto-refresh.
+
+```python
+import streamlit as st
+import time
+
+st.set_page_config(page_title="Health Dashboard", layout="wide")
+st.title("Microservice Health Dashboard")
+
+while True:
+    # Fetch current metrics
+    health_data = fetch_health()
+
+    # Display summary
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Services", len(health_data))
+    col2.metric("Healthy", sum(1 for s in health_data.values() if s['status'] == 'healthy'))
+    col3.metric("Degraded", sum(1 for s in health_data.values() if s['status'] == 'degraded'))
+    col4.metric("Critical", sum(1 for s in health_data.values() if s['status'] == 'critical'))
+
+    # Display service cards
+    cols = st.columns(4)
+    for i, (service, data) in enumerate(health_data.items()):
+        with cols[i % 4]:
+            status_emoji = {"healthy": "🟢", "degraded": "🟡", "critical": "🔴"}[data['status']]
+            st.metric(f"{status_emoji} {service}", f"Max Z: {data['max_z']:.1f}")
+
+    time.sleep(30)
+    st.rerun()
+```
+
+## How the Pieces Connect
+
+```
+Prometheus API + Kubernetes API
+              │
+              ▼
+┌─────────────────┐
+│ Metric Fetcher   │ ←─── Gets current metric values
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ Health Status    │ ←─── Computes z-scores, determines status
+│ Calculator       │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ Streamlit        │ ←─── Renders dashboard
+│ Dashboard        │
+└─────────────────┘
+```
+
+## Understanding Checkpoints
+
+1. "Can I fetch current metric values from Prometheus and display them in Streamlit?" — If no, check your PromQL queries and Streamlit setup.
+2. "Does the health status correctly reflect the z-score thresholds?" — If no, check your threshold logic.
+3. "Does the dashboard auto-refresh without manual intervention?" — If no, check your `st.rerun()` loop.
+
+## Common Mistakes
+
+1. **Not handling services with no metrics.** If a service has no data, it should be shown as "unknown" rather than crashing.
+2. **Querying Prometheus too frequently.** Auto-refreshing every 30 seconds is fine. Every 5 seconds will overload Prometheus.
+3. **Not handling Prometheus downtime.** If Prometheus is unreachable, the dashboard should show an error message rather than crashing.
+
+## Ship Criteria
+
+- [ ] Displays all services with health status
+- [ ] Color-coded by health (green/yellow/red)
+- [ ] Shows CPU, memory, latency, error rate per service
+- [ ] Auto-refreshes every 30 seconds
+- [ ] Summary bar with counts
+- [ ] Clickable service cards with metric trends
+- [ ] Runs with `streamlit run dashboard.py`
+- [ ] README with setup instructions and screenshots

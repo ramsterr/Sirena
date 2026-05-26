@@ -1,0 +1,168 @@
+apiVersion: v1
+data:
+  yelb-obs.json: "{\n  \"annotations\": {\n    \"list\": []\n  },\n  \"editable\"\
+    : true,\n  \"fiscalYearStartMonth\": 0,\n  \"graphTooltip\": 1,\n  \"links\":\
+    \ [],\n  \"panels\": [\n    {\n      \"datasource\": {\n        \"type\": \"prometheus\"\
+    ,\n        \"uid\": \"${DS_PROMETHEUS}\"\n      },\n      \"fieldConfig\": {\n\
+    \        \"defaults\": {\n          \"color\": {\n            \"mode\": \"palette-classic\"\
+    \n          },\n          \"custom\": {\n            \"axisCenteredZero\": false,\n\
+    \            \"axisColorMode\": \"text\",\n            \"axisLabel\": \"\",\n\
+    \            \"axisPlacement\": \"auto\",\n            \"fillOpacity\": 10,\n\
+    \            \"gradientMode\": \"none\",\n            \"hideFrom\": {\n      \
+    \        \"legend\": false,\n              \"tooltip\": false,\n             \
+    \ \"viz\": false\n            },\n            \"lineWidth\": 1,\n            \"\
+    pointSize\": 5,\n            \"scaleDistribution\": {\n              \"type\"\
+    : \"linear\"\n            },\n            \"showPoints\": \"never\",\n       \
+    \     \"spanNulls\": false\n          },\n          \"unit\": \"reqps\"\n    \
+    \    },\n        \"overrides\": []\n      },\n      \"gridPos\": {\n        \"\
+    h\": 8,\n        \"w\": 12,\n        \"x\": 0,\n        \"y\": 0\n      },\n \
+    \     \"id\": 1,\n      \"options\": {\n        \"legend\": {\n          \"calcs\"\
+    : [],\n          \"displayMode\": \"list\",\n          \"placement\": \"bottom\"\
+    ,\n          \"showLegend\": true\n        },\n        \"tooltip\": {\n      \
+    \    \"mode\": \"multi\",\n          \"sort\": \"none\"\n        }\n      },\n\
+    \      \"targets\": [\n        {\n          \"expr\": \"probe_success{job=\\\"\
+    yelb-appserver-probe\\\"}\",\n          \"legendFormat\": \"{{instance}}\",\n\
+    \          \"refId\": \"A\"\n        }\n      ],\n      \"title\": \"Yelb Service\
+    \ Availability (Probe Success)\",\n      \"type\": \"timeseries\"\n    },\n  \
+    \  {\n      \"datasource\": {\n        \"type\": \"prometheus\",\n        \"uid\"\
+    : \"${DS_PROMETHEUS}\"\n      },\n      \"fieldConfig\": {\n        \"defaults\"\
+    : {\n          \"color\": {\n            \"mode\": \"palette-classic\"\n     \
+    \     },\n          \"custom\": {\n            \"axisCenteredZero\": false,\n\
+    \            \"axisColorMode\": \"text\",\n            \"axisLabel\": \"\",\n\
+    \            \"axisPlacement\": \"auto\",\n            \"fillOpacity\": 10,\n\
+    \            \"gradientMode\": \"none\",\n            \"hideFrom\": {\n      \
+    \        \"legend\": false,\n              \"tooltip\": false,\n             \
+    \ \"viz\": false\n            },\n            \"lineWidth\": 1,\n            \"\
+    pointSize\": 5,\n            \"scaleDistribution\": {\n              \"type\"\
+    : \"linear\"\n            },\n            \"showPoints\": \"never\",\n       \
+    \     \"spanNulls\": false\n          },\n          \"unit\": \"s\"\n        },\n\
+    \        \"overrides\": []\n      },\n      \"gridPos\": {\n        \"h\": 8,\n\
+    \        \"w\": 12,\n        \"x\": 12,\n        \"y\": 0\n      },\n      \"\
+    id\": 2,\n      \"options\": {\n        \"legend\": {\n          \"calcs\": [],\n\
+    \          \"displayMode\": \"list\",\n          \"placement\": \"bottom\",\n\
+    \          \"showLegend\": true\n        },\n        \"tooltip\": {\n        \
+    \  \"mode\": \"multi\",\n          \"sort\": \"none\"\n        }\n      },\n \
+    \     \"targets\": [\n        {\n          \"expr\": \"probe_http_duration_seconds{job=\\\
+    \"yelb-appserver-probe\\\"}\",\n          \"legendFormat\": \"{{instance}} phase={{phase}}\"\
+    ,\n          \"refId\": \"A\"\n        }\n      ],\n      \"title\": \"Yelb HTTP\
+    \ Probe Latency\",\n      \"type\": \"timeseries\"\n    },\n    {\n      \"datasource\"\
+    : {\n        \"type\": \"prometheus\",\n        \"uid\": \"${DS_PROMETHEUS}\"\n\
+    \      },\n      \"fieldConfig\": {\n        \"defaults\": {\n          \"color\"\
+    : {\n            \"mode\": \"palette-classic\"\n          },\n          \"custom\"\
+    : {\n            \"axisCenteredZero\": false,\n            \"axisColorMode\":\
+    \ \"text\",\n            \"axisLabel\": \"\",\n            \"axisPlacement\":\
+    \ \"auto\",\n            \"fillOpacity\": 10,\n            \"gradientMode\": \"\
+    none\",\n            \"hideFrom\": {\n              \"legend\": false,\n     \
+    \         \"tooltip\": false,\n              \"viz\": false\n            },\n\
+    \            \"lineWidth\": 1,\n            \"pointSize\": 5,\n            \"\
+    scaleDistribution\": {\n              \"type\": \"linear\"\n            },\n \
+    \           \"showPoints\": \"never\",\n            \"spanNulls\": false\n   \
+    \       },\n          \"unit\": \"short\"\n        },\n        \"overrides\":\
+    \ []\n      },\n      \"gridPos\": {\n        \"h\": 8,\n        \"w\": 12,\n\
+    \        \"x\": 0,\n        \"y\": 8\n      },\n      \"id\": 3,\n      \"options\"\
+    : {\n        \"legend\": {\n          \"calcs\": [],\n          \"displayMode\"\
+    : \"list\",\n          \"placement\": \"bottom\",\n          \"showLegend\": true\n\
+    \        },\n        \"tooltip\": {\n          \"mode\": \"multi\",\n        \
+    \  \"sort\": \"none\"\n        }\n      },\n      \"targets\": [\n        {\n\
+    \          \"expr\": \"rate(container_cpu_usage_seconds_total{namespace=\\\"default\\\
+    \",pod=~\\\"yelb-.*|redis-.*\\\",container!=\\\"POD\\\",container!=\\\"\\\"}[5m])\"\
+    ,\n          \"legendFormat\": \"{{pod}}\",\n          \"refId\": \"A\"\n    \
+    \    }\n      ],\n      \"title\": \"Yelb Services CPU Usage\",\n      \"type\"\
+    : \"timeseries\"\n    },\n    {\n      \"datasource\": {\n        \"type\": \"\
+    prometheus\",\n        \"uid\": \"${DS_PROMETHEUS}\"\n      },\n      \"fieldConfig\"\
+    : {\n        \"defaults\": {\n          \"color\": {\n            \"mode\": \"\
+    palette-classic\"\n          },\n          \"custom\": {\n            \"axisCenteredZero\"\
+    : false,\n            \"axisColorMode\": \"text\",\n            \"axisLabel\"\
+    : \"\",\n            \"axisPlacement\": \"auto\",\n            \"fillOpacity\"\
+    : 10,\n            \"gradientMode\": \"none\",\n            \"hideFrom\": {\n\
+    \              \"legend\": false,\n              \"tooltip\": false,\n       \
+    \       \"viz\": false\n            },\n            \"lineWidth\": 1,\n      \
+    \      \"pointSize\": 5,\n            \"scaleDistribution\": {\n             \
+    \ \"type\": \"linear\"\n            },\n            \"showPoints\": \"never\"\
+    ,\n            \"spanNulls\": false\n          },\n          \"unit\": \"bytes\"\
+    \n        },\n        \"overrides\": []\n      },\n      \"gridPos\": {\n    \
+    \    \"h\": 8,\n        \"w\": 12,\n        \"x\": 12,\n        \"y\": 8\n   \
+    \   },\n      \"id\": 4,\n      \"options\": {\n        \"legend\": {\n      \
+    \    \"calcs\": [],\n          \"displayMode\": \"list\",\n          \"placement\"\
+    : \"bottom\",\n          \"showLegend\": true\n        },\n        \"tooltip\"\
+    : {\n          \"mode\": \"multi\",\n          \"sort\": \"none\"\n        }\n\
+    \      },\n      \"targets\": [\n        {\n          \"expr\": \"container_memory_working_set_bytes{namespace=\\\
+    \"default\\\",pod=~\\\"yelb-.*|redis-.*\\\",container!=\\\"POD\\\",container!=\\\
+    \"\\\"}\",\n          \"legendFormat\": \"{{pod}}\",\n          \"refId\": \"\
+    A\"\n        }\n      ],\n      \"title\": \"Yelb Services Memory Usage\",\n \
+    \     \"type\": \"timeseries\"\n    },\n    {\n      \"datasource\": {\n     \
+    \   \"type\": \"prometheus\",\n        \"uid\": \"${DS_PROMETHEUS}\"\n      },\n\
+    \      \"fieldConfig\": {\n        \"defaults\": {\n          \"color\": {\n \
+    \           \"mode\": \"palette-classic\"\n          },\n          \"custom\"\
+    : {\n            \"axisCenteredZero\": false,\n            \"axisColorMode\":\
+    \ \"text\",\n            \"axisLabel\": \"\",\n            \"axisPlacement\":\
+    \ \"auto\",\n            \"fillOpacity\": 10,\n            \"gradientMode\": \"\
+    none\",\n            \"hideFrom\": {\n              \"legend\": false,\n     \
+    \         \"tooltip\": false,\n              \"viz\": false\n            },\n\
+    \            \"lineWidth\": 1,\n            \"pointSize\": 5,\n            \"\
+    scaleDistribution\": {\n              \"type\": \"linear\"\n            },\n \
+    \           \"showPoints\": \"never\",\n            \"spanNulls\": false\n   \
+    \       },\n          \"unit\": \"Bps\"\n        },\n        \"overrides\": []\n\
+    \      },\n      \"gridPos\": {\n        \"h\": 8,\n        \"w\": 12,\n     \
+    \   \"x\": 0,\n        \"y\": 16\n      },\n      \"id\": 5,\n      \"options\"\
+    : {\n        \"legend\": {\n          \"calcs\": [],\n          \"displayMode\"\
+    : \"list\",\n          \"placement\": \"bottom\",\n          \"showLegend\": true\n\
+    \        },\n        \"tooltip\": {\n          \"mode\": \"multi\",\n        \
+    \  \"sort\": \"none\"\n        }\n      },\n      \"targets\": [\n        {\n\
+    \          \"expr\": \"rate(container_network_transmit_bytes_total{namespace=\\\
+    \"default\\\",pod=~\\\"yelb-.*|redis-.*\\\"}[5m])\",\n          \"legendFormat\"\
+    : \"{{pod}} TX\",\n          \"refId\": \"A\"\n        },\n        {\n       \
+    \   \"expr\": \"rate(container_network_receive_bytes_total{namespace=\\\"default\\\
+    \",pod=~\\\"yelb-.*|redis-.*\\\"}[5m])\",\n          \"legendFormat\": \"{{pod}}\
+    \ RX\",\n          \"refId\": \"B\"\n        }\n      ],\n      \"title\": \"\
+    Yelb Services Network I/O\",\n      \"type\": \"timeseries\"\n    },\n    {\n\
+    \      \"datasource\": {\n        \"type\": \"prometheus\",\n        \"uid\":\
+    \ \"${DS_PROMETHEUS}\"\n      },\n      \"fieldConfig\": {\n        \"defaults\"\
+    : {\n          \"mappings\": [],\n          \"thresholds\": {\n            \"\
+    mode\": \"absolute\",\n            \"steps\": [\n              {\n           \
+    \     \"color\": \"green\",\n                \"value\": null\n              },\n\
+    \              {\n                \"color\": \"red\",\n                \"value\"\
+    : 80\n              }\n            ]\n          },\n          \"unit\": \"short\"\
+    \n        }\n      },\n      \"gridPos\": {\n        \"h\": 4,\n        \"w\"\
+    : 6,\n        \"x\": 12,\n        \"y\": 16\n      },\n      \"id\": 6,\n    \
+    \  \"options\": {\n        \"colorMode\": \"value\",\n        \"graphMode\": \"\
+    area\",\n        \"justifyMode\": \"auto\",\n        \"orientation\": \"auto\"\
+    ,\n        \"reduceOptions\": {\n          \"calcs\": [\n            \"lastNotNull\"\
+    \n          ],\n          \"fields\": \"\",\n          \"values\": false\n   \
+    \     },\n        \"textMode\": \"auto\"\n      },\n      \"targets\": [\n   \
+    \     {\n          \"expr\": \"avg(probe_success{job=~\\\"yelb.*\\\"})\",\n  \
+    \        \"legendFormat\": \"Availability\",\n          \"refId\": \"A\"\n   \
+    \     }\n      ],\n      \"title\": \"Service Availability\",\n      \"type\"\
+    : \"stat\"\n    },\n    {\n      \"datasource\": {\n        \"type\": \"prometheus\"\
+    ,\n        \"uid\": \"${DS_PROMETHEUS}\"\n      },\n      \"fieldConfig\": {\n\
+    \        \"defaults\": {\n          \"mappings\": [],\n          \"thresholds\"\
+    : {\n            \"mode\": \"absolute\",\n            \"steps\": [\n         \
+    \     {\n                \"color\": \"green\",\n                \"value\": null\n\
+    \              },\n              {\n                \"color\": \"yellow\",\n \
+    \               \"value\": 1\n              },\n              {\n            \
+    \    \"color\": \"red\",\n                \"value\": 5\n              }\n    \
+    \        ]\n          },\n          \"unit\": \"s\"\n        }\n      },\n   \
+    \   \"gridPos\": {\n        \"h\": 4,\n        \"w\": 6,\n        \"x\": 18,\n\
+    \        \"y\": 16\n      },\n      \"id\": 7,\n      \"options\": {\n       \
+    \ \"colorMode\": \"value\",\n        \"graphMode\": \"area\",\n        \"justifyMode\"\
+    : \"auto\",\n        \"orientation\": \"auto\",\n        \"reduceOptions\": {\n\
+    \          \"calcs\": [\n            \"lastNotNull\"\n          ],\n         \
+    \ \"fields\": \"\",\n          \"values\": false\n        },\n        \"textMode\"\
+    : \"auto\"\n      },\n      \"targets\": [\n        {\n          \"expr\": \"\
+    avg(probe_duration_seconds{job=\\\"yelb-appserver-probe\\\"})\",\n          \"\
+    legendFormat\": \"Latency\",\n          \"refId\": \"A\"\n        }\n      ],\n\
+    \      \"title\": \"Avg Response Latency\",\n      \"type\": \"stat\"\n    }\n\
+    \  ],\n  \"schemaVersion\": 38,\n  \"style\": \"dark\",\n  \"tags\": [\n    \"\
+    yelb\"\n  ],\n  \"templating\": {\n    \"list\": [\n      {\n        \"current\"\
+    : {\n          \"text\": \"Prometheus\",\n          \"value\": \"Prometheus\"\n\
+    \        },\n        \"hide\": 0,\n        \"name\": \"DS_PROMETHEUS\",\n    \
+    \    \"options\": [],\n        \"query\": \"prometheus\",\n        \"type\": \"\
+    datasource\"\n      }\n    ]\n  },\n  \"time\": {\n    \"from\": \"now-1h\",\n\
+    \    \"to\": \"now\"\n  },\n  \"title\": \"Yelb Observability Dashboard\",\n \
+    \ \"uid\": \"yelb-obs\",\n  \"version\": 2\n}"
+kind: ConfigMap
+metadata:
+  labels:
+    grafana_dashboard: '1'
+  name: grafana-dashboard-yelb
+  namespace: default

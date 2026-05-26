@@ -1,0 +1,1522 @@
+# SRE Root Cause Analysis Tool — Master Build Reference
+
+> This document is the canonical reference for building an SRE root cause analysis tool from scratch. It is structured so that both a human developer and an LLM assistant can read any phase and understand: what is being built, why it works, what must be understood before coding, what must be coded, and how each piece connects to the whole. Use this as the source of truth when prompting for implementation help.
+
+---
+
+## Meta-Structure: How to Read This Document
+
+Each phase contains these sections:
+
+- **Real Objective** — What you are *actually* trying to accomplish, stated in plain English, not in technical jargon. Read this first. If you lose the thread while coding, come back here.
+- **Tool Objective** — What the software tool must do at the end of this phase. This is the acceptance test.
+- **What You Must Understand Before Coding** — Concepts, their internals, and why they matter. Each concept includes: what it is, how it works at a level deep enough to implement it, where it can go wrong, and a self-check question. Do not skip these. If you cannot answer the self-check, study more before coding.
+- **What to Study and Where** — Specific resources, specific sections, specific things to extract. Not "learn Prometheus" but "read these specific PromQL patterns because you will need them in Week 5."
+- **What to Code** — Each component, its purpose, its inputs, its outputs, its internals, and how to verify it works. Written at a level of detail where you can sit down and implement it.
+- **How the Pieces Connect** — A data flow showing how output from one component becomes input to the next. This is the pipeline.
+- **Understanding Checkpoints** — Concrete things you should be able to explain or demonstrate before moving on.
+- **Common Mistakes** — What people get wrong, why it breaks things, and how to avoid it.
+
+---
+
+## Phase 0: Foundation — The Observability Lab
+
+### Real Objective
+
+You are setting up a miniature version of a real production microservice system so you have something to *practice diagnosing*. Think of it like a medical student setting up a practice clinic — you need patients (a running system), diagnostic equipment (traces, metrics, logs), and the ability to deliberately make the patients sick (fault injection). Without this, every algorithm you build is theoretical. With this, you can test every line of code against real data.
+
+### Tool Objective
+
+By the end of Phase 0, you should be able to:
+1. Open Jaeger and see traces from 11 services flowing through the Online Boutique app
+2. Open Prometheus and query any metric for any service
+3. Open Grafana and see dashboards with live data
+4. Inject a fault (e.g., add latency to a service) and see the traces and metrics change in real time
+
+### What You Must Understand Before Coding
+
+#### Concept 1: What a Distributed Trace Actually Is
+
+A distributed trace is NOT just "a log of what happened." It is a **directed tree of spans** that represents one complete user request as it travels through multiple services.
+
+A **span** is a single unit of work — one service handling one part of the request. Each span has:
+- A `trace_id` — identifies the entire request. Every span in the same request shares this ID.
+- A `span_id` — unique identifier for this particular span.
+- A `parent_id` — the `span_id` of the span that called this one. If `parent_id` is empty/undefined, this is the root span (the first service that received the user's request).
+- A `service_name` — which service performed this work.
+- An `operation_name` — what method/endpoint was called (e.g., `GET /cart` or `Checkout`).
+- A `start_time` and `duration` — when and how long.
+- A `status` — OK or ERROR.
+
+The parent-child relationship between spans reconstructs the call tree:
+
+```
+trace_id: abc123
+├── span: frontend/Checkout (root, parent_id=none, duration=450ms)
+│   ├── span: cartService/GetCart (parent=frontend, duration=50ms)
+│   ├── span: paymentService/Charge (parent=frontend, duration=300ms)
+│   │   └── span: database/Query (parent=paymentService, duration=280ms)
+│   └── span: emailService/SendReceipt (parent=frontend, duration=80ms)
+```
+
+**Why this matters:** The entire Phase 1 algorithm operates on this tree structure. The dependency graph is built by extracting parent-child relationships across thousands of traces. The anomaly detection looks at span durations. The spectrum scoring counts which services appear in which traces. If you do not deeply understand this tree, you will make wrong assumptions about what a "trace" is when you parse the data.
+
+**Self-check:** Can you draw the span tree for a request that goes Frontend → CartService → PaymentService → Database? Can you identify which span is the root? Can you explain why the database span's parent is the paymentService span and not the frontend span?
+
+**Common mistake:** Confusing traces with logs. A log line is "something happened at time T." A trace span is "service X did work Y as part of request Z, it took D milliseconds, and it was called by service W." The trace preserves the *causal structure* of the request — who called whom, in what order, with what latency. Logs do not.
+
+#### Concept 2: What Prometheus Metrics Actually Are
+
+Prometheus stores **time series** — sequences of (timestamp, value) pairs identified by a metric name and a set of labels.
+
+A metric name is like `http_server_request_duration_seconds`. Labels are key-value pairs like `{service="cart-service", method="GET", status="200"}`. The combination of metric name + all label values = one unique time series.
+
+There are four metric types you need to understand:
+
+1. **Counter**: A number that only goes UP. Example: `http_requests_total{service="cart", status="500"}` starts at 0 and increments every time a 500 error occurs. You NEVER read a counter directly — you always use `rate()` or `increase()` to compute how fast it's growing. Raw counter values are meaningless because they reset on restart.
+
+2. **Gauge**: A number that can go up or down. Example: `container_memory_working_set_bytes{pod="cart-pod-3"}` = current memory usage. You CAN read a gauge directly at any point in time.
+
+3. **Histogram**: Samples observations into configurable buckets. Example: `http_request_duration_seconds_bucket{le="0.1", service="cart"}` = number of requests that completed in ≤0.1 seconds. Histograms let you compute percentiles (P50, P95, P99) using `histogram_quantile()`.
+
+4. **Summary**: Similar to histogram but pre-computed on the client side. Less commonly used in the Kubernetes ecosystem.
+
+**Why this matters:** In Phase 2, you will query Prometheus for metric data to detect anomalies. If you query a counter directly instead of using `rate()`, you'll get garbage. If you try to compute a percentile from a gauge instead of a histogram, you'll get an error. Understanding metric types is not optional — it's the difference between working code and nonsense.
+
+**Self-check:** Given the metric `http_requests_total{service="cart", status="500"}`, can you write a PromQL query that gives you the per-second error rate over the last 5 minutes? Answer: `rate(http_requests_total{service="cart", status="500"}[5m])`. Can you explain why you need `rate()` and not just the raw value?
+
+**Common mistake:** Querying `http_requests_total` directly and getting a monotonically increasing number, then treating it as if it represents current error rate. It doesn't. It represents the *total since the process started*. You must always use `rate()`, `increase()`, or `irate()` on counters.
+
+#### Concept 3: The Service Dependency Graph
+
+A service dependency graph is a **directed graph** where:
+- Each node = one service (e.g., `cart-service`, `payment-service`)
+- Each directed edge = "service A calls service B" (e.g., `frontend → cart-service`)
+- Edge weight = how often A calls B (call frequency)
+
+This graph is NOT the same as the trace tree. The trace tree represents ONE request. The dependency graph represents ALL observed call patterns across ALL requests, aggregated together.
+
+**Why this matters:** MicroRank's core algorithm (PageRank) operates on this graph. The graph structure determines which services are "central" (connected to many others) and which are "peripheral" (few connections). A root cause in a central service will cause widespread symptoms. A root cause in a peripheral service will cause localized symptoms. PageRank uses this structure to weigh anomaly scores.
+
+**Self-check:** Given 100 traces where `frontend` calls `cart-service` in 95 of them and `email-service` in 30 of them, what are the edge weights in the dependency graph? Answer: edge `frontend→cart-service` has weight 95, edge `frontend→email-service` has weight 30. Can you explain why `email-service` might have a lower weight? (Because not every request triggers an email — only completed purchases do.)
+
+**Common mistake:** Building the dependency graph from documentation or configuration instead of from actual traces. The documented architecture says "service A calls service B," but in practice, service A might only call B during error recovery (rare), or might call B via a message queue (asynchronous, harder to trace). Always build the graph from observed traces.
+
+#### Concept 4: Kubernetes Networking for Fault Injection
+
+To test your tool, you need to deliberately break services and observe the results. The three main fault injection techniques are:
+
+1. **Network latency injection** using `tc` (traffic control): `kubectl exec <pod> -- tc qdisc add dev eth0 root netem delay 500ms` — adds 500ms of artificial latency to all network traffic from this pod. This simulates network degradation.
+
+2. **CPU stress** using `stress-ng`: `kubectl exec <pod> -- stress-ng --cpu 4 --timeout 300s` — spawns 4 CPU-bound workers. This simulates resource exhaustion.
+
+3. **Pod scaling**: `kubectl scale deployment <deployment> --replicas=1` — reduces available capacity. This simulates partial outages.
+
+**Why this matters:** Your entire testing strategy depends on fault injection. If you can't reliably create faults, you can't test your tool. Each fault type creates a different "failure signature" in the data — network latency shows up in trace durations, CPU stress shows up in metric anomalies, pod scaling shows up in both. Understanding these signatures is how you validate that your tool detects the right thing.
+
+**Self-check:** If you inject 500ms of network latency into the `payment-service`, what would you expect to see in Jaeger? What would you expect to see in Prometheus? Answer: In Jaeger, the duration of `payment-service` spans would increase by ~500ms. In Prometheus, the latency metrics for `payment-service` would spike, and the error rate for upstream services (like `cart-service`) would increase due to timeouts.
+
+### What to Study and Where
+
+| What | Where | What to Extract |
+|---|---|---|
+| OpenTelemetry trace data model | [OpenTelemetry Spec: Traces](https://opentelemetry.io/docs/concepts/signals/traces/) | Understand trace_id, span_id, parent_id, attributes, status. You will parse these fields. |
+| Jaeger API | [Jaeger HTTP API docs](https://www.jaegertracing.io/docs/latest/api/) | Specifically the `GET /api/traces` endpoint. You will call this to fetch traces. Understand the query parameters: `service`, `operation`, `lookback`, `start`, `end`. |
+| PromQL basics | [Prometheus Querying](https://prometheus.io/docs/prometheus/latest/querying/basics/) | Focus on: `rate()`, `histogram_quantile()`, label matchers `{service="X"}`, range vectors `[5m]`. You will write these queries in Phase 2. |
+| Kubernetes fault injection | [Chaos Mesh docs](https://chaos-mesh.org/docs/chaos-experiments-overview/) or manual `tc`/`stress-ng` | Understand NetworkChaos, StressChaos. You will automate fault injection in Phase 2's test suite. |
+| Online Boutique architecture | [GitHub README](https://github.com/GoogleCloudPlatform/microservices-demo) | Memorize the 11 services and their call relationships. This is your test system's anatomy. |
+
+### What to Set Up (Not Code — Infrastructure)
+
+**Step 1: Kubernetes Cluster**
+```bash
+# Option A: minikube (simpler, runs locally)
+minikube start --cpus=4 --memory=8192
+
+# Option B: kind (Kubernetes in Docker, more production-like)
+kind create cluster --config kind-config.yaml
+```
+You need at least 4 CPU cores and 8GB RAM. The 11 services + observability stack will use ~6GB.
+
+**Step 2: Deploy Online Boutique**
+```bash
+kubectl apply -f https://raw.githubusercontent.com/GoogleCloudPlatform/microservices-demo/main/release/kubernetes-manifests.yaml
+```
+Wait for all pods to be Running: `kubectl get pods -w`. Expected: 11 pods, all Running.
+
+**Step 3: Deploy Jaeger (Trace Collection)**
+```bash
+# Add Jaeger operator
+kubectl create namespace observability
+kubectl apply -f https://github.com/jaegertracing/jaeger-operator/releases/download/v1.53.0/jaeger-operator.yaml -n observability
+
+# Create a Jaeger instance
+kubectl apply -f - <<EOF
+apiVersion: jaegertracing.io/v1
+kind: Jaeger
+metadata:
+  name: jaeger
+spec:
+  strategy: allInOne
+  allInOne:
+    options:
+      log-level: info
+EOF
+
+# Port-forward to access Jaeger UI
+kubectl port-forward svc/jaeger-query 16686:16686
+```
+Verify: Open http://localhost:16686. You should see the Jaeger UI. Select "frontend" service and click "Find Traces." You should see traces.
+
+**Step 4: Deploy Prometheus (Metric Collection)**
+```bash
+# Using kube-prometheus-stack (includes Prometheus + Grafana)
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm install prometheus prometheus-community/kube-prometheus-stack
+
+# Port-forward
+kubectl port-forward svc/prometheus-kube-prometheus-prometheus 9090:9090
+kubectl port-forward svc/prometheus-grafana 3000:80
+```
+Verify: Open http://localhost:9090. Type `up` in the query box and click Execute. You should see targets. Open http://localhost:3000 (Grafana, admin/prom-operator). Navigate to a dashboard and confirm you see live metrics.
+
+**Step 5: Generate Load**
+```bash
+# Use the load generator included in Online Boutique
+# OR use hey/wrk:
+hey -z 30m -c 10 http://<FRONTEND_EXTERNAL_IP>
+```
+You need continuous traffic for at least 30 minutes before you have enough data for Phase 1. Leave this running in the background.
+
+**Step 6: Verify End-to-End**
+1. Open Jaeger UI → Select `frontend` service → Find Traces → You see traces with 3+ spans each
+2. Open Prometheus UI → Query `rate(http_server_requests_total[5m])` → You see non-zero values
+3. Open Grafana → See live dashboards
+4. Inject a test fault: `kubectl exec -c server <CART_SERVICE_POD> -- tc qdisc add dev eth0 root netem delay 200ms`
+5. Wait 2 minutes → Check Jaeger → Cart service spans should show increased duration
+6. Remove fault: `kubectl exec -c server <CART_SERVICE_POD> -- tc qdisc del dev eth0 root`
+
+### Understanding Checkpoints for Phase 0
+
+Before moving to Phase 1, you must be able to answer all of these:
+
+1. "If I look at a trace in Jaeger, can I identify the trace_id, each span's service name, its parent span, and its duration?" — If no, spend more time in the Jaeger UI.
+2. "Can I write a PromQL query that gives me the P95 latency of the cart-service over the last 10 minutes?" — If no, study PromQL more.
+3. "If I inject latency into the payment-service, can I see the change in both Jaeger and Prometheus within 2 minutes?" — If no, your observability pipeline has a gap.
+4. "Can I explain, in my own words, what the parent_id field in a span does and why it matters for building a dependency graph?" — If no, re-read Concept 1.
+
+---
+
+## Phase 1: MicroRank Core — Trace-Based Root Cause Ranking
+
+### Real Objective
+
+You are building the algorithm that answers: "Given that something is wrong (users are seeing errors), which service is most likely the root cause, based only on trace data?"
+
+Think of it like a detective at a crime scene. You have 1000 witness statements (traces). Some witnesses describe a normal day (normal traces). Some describe a chaotic day where everything went wrong (anomalous traces). Your job is to find which person (service) appears most frequently in the chaotic stories and least frequently in the normal stories. That person is your prime suspect.
+
+The algorithm has three steps:
+1. **Split** the traces into "normal" and "anomalous" (anomaly detection)
+2. **Score** each service based on how strongly it's associated with anomalous traces (spectrum scoring)
+3. **Rank** the services considering both their suspiciousness score AND their position in the call graph (Personalized PageRank)
+
+### Tool Objective
+
+By the end of Phase 1, the tool must:
+1. Accept an incident timestamp as input
+2. Fetch traces from Jaeger for the time window around the incident
+3. Classify traces as normal or anomalous
+4. Build a service dependency graph from the traces
+5. Compute spectrum-based anomaly scores for each service
+6. Run Personalized PageRank to produce a final ranking
+7. Output a ranked list of (service_name, score) pairs
+8. Correctly identify the artificially-faulted service as the top-1 or top-3 result
+
+### What You Must Understand Before Coding
+
+#### Concept 5: Spectrum-Based Fault Localization (The Ochiai Formula)
+
+This technique was originally invented for software bug localization — finding which line of code caused a test to fail. MicroRank adapts it for microservices — finding which service caused a trace to be anomalous.
+
+The core idea: if a service is the root cause, it should appear in almost all anomalous traces (because its failure propagates downstream) and in few normal traces (because it only causes problems when it's actually broken).
+
+The Ochiai coefficient for a service $s$ is:
+
+$$\text{Ochiai}(s) = \frac{n_{ef}(s)}{\sqrt{n_f \cdot n_e(s)}}$$
+
+Where:
+- $n_{ef}(s)$ = number of **anomalous** traces that contain service $s$ (e = "executed", f = "failed" — so "ef" means "the service was involved AND the trace was anomalous")
+- $n_f$ = total number of anomalous traces (regardless of which services they contain)
+- $n_e(s)$ = total number of traces (both normal and anomalous) that contain service $s$
+
+**Interpretation:**
+- If Ochiai(s) ≈ 1.0: service $s$ appears in nearly all anomalous traces and very few normal traces → very likely the root cause
+- If Ochiai(s) ≈ 0.0: service $s$ appears in few anomalous traces or many normal traces → unlikely the root cause
+- If Ochiai(s) ≈ 0.5: ambiguous — could be a victim (downstream of the real root cause) or a secondary issue
+
+**Why this matters:** This is the *entire scoring mechanism* for Phase 1. Every other component exists to either produce the inputs to this formula (anomalous vs. normal classification) or to refine its output (PageRank adjusts raw Ochiai scores based on graph structure).
+
+**Walk-through with numbers:**
+
+Say you have 100 traces total. 20 are anomalous, 80 are normal.
+
+Service `inventory-service` appears in 19 anomalous traces and 5 normal traces:
+$$\text{Ochiai}(\text{inventory}) = \frac{19}{\sqrt{20 \cdot 24}} = \frac{19}{\sqrt{480}} = \frac{19}{21.9} = 0.868$$
+
+Service `frontend` appears in 20 anomalous traces and 80 normal traces (it's in every trace because it's the entry point):
+$$\text{Ochiai}(\text{frontend}) = \frac{20}{\sqrt{20 \cdot 100}} = \frac{20}{\sqrt{2000}} = \frac{20}{44.7} = 0.447$$
+
+The frontend has a lower score because it appears in ALL traces (both normal and anomalous), so its presence doesn't distinguish anomalous from normal. The inventory service appears almost exclusively in anomalous traces, so its presence is a strong signal.
+
+**Self-check:** Given 50 anomalous traces and 100 normal traces. Service X appears in 45 anomalous traces and 10 normal traces. Service Y appears in 50 anomalous traces and 100 normal traces. Which has a higher Ochiai score? Can you compute both?
+
+**Common mistake:** Using the raw count of anomalous traces a service appears in as the score, without normalizing by how often the service appears in general. The frontend will always appear in the most anomalous traces because it appears in ALL traces. The Ochiai formula's denominator corrects for this.
+
+#### Concept 6: Personalized PageRank
+
+Standard PageRank computes the "importance" of each node in a graph by simulating a random surfer who follows links randomly. At each step, with probability $\alpha$ (damping factor, typically 0.85), the surfer follows a random outgoing edge. With probability $1 - \alpha$, the surfer teleports to a random node in the graph (uniform probability).
+
+**Personalized PageRank** changes the teleportation step: instead of teleporting to any node uniformly, the surfer teleports to nodes according to a **personalization vector** — a probability distribution over nodes that reflects which nodes are "preferred."
+
+In your case, the personalization vector comes from the Ochiai scores. Services with high Ochiai scores are "preferred" teleport destinations. This means the random surfer spends more time near suspicious services, and the final PageRank scores reflect both graph centrality AND suspiciousness.
+
+**Why both Ochiai AND PageRank?** Because Ochiai alone can be misleading. Consider:
+- Service A is the root cause. It has Ochiai score 0.87.
+- Service B is downstream of A. It has Ochiai score 0.82 (almost as high, because every trace that hits A also hits B).
+- Service C is upstream of A. It has Ochiai score 0.15 (low, because it's not affected).
+
+Ochiai alone ranks A slightly above B. But in the dependency graph, A is upstream of B — A's failure *causes* B's symptoms. PageRank captures this: A is "feeding" anomaly to B, so A should be ranked higher. The personalization vector starts with A and B having similar "preference," but PageRank's propagation through the graph structure amplifies A because it's the source.
+
+**Mathematical formulation:**
+
+The PageRank vector $\mathbf{r}$ is the solution to:
+$$\mathbf{r} = \alpha \cdot \mathbf{M} \cdot \mathbf{r} + (1 - \alpha) \cdot \mathbf{p}$$
+
+Where:
+- $\mathbf{M}$ is the column-normalized adjacency matrix of the dependency graph (each column sums to 1)
+- $\mathbf{p}$ is the personalization vector (Ochiai scores, normalized to sum to 1)
+- $\alpha$ is the damping factor (0.85)
+- $\mathbf{r}$ is the PageRank vector you're solving for
+
+This is solved iteratively: start with $\mathbf{r}^{(0)} = \mathbf{p}$, then iterate $\mathbf{r}^{(t+1)} = \alpha \cdot \mathbf{M} \cdot \mathbf{r}^{(t)} + (1 - \alpha) \cdot \mathbf{p}$ until convergence (change < $\epsilon$).
+
+**Self-check:** Can you explain, in your own words, why standard PageRank (with uniform personalization) would rank the frontend as the most important node in a microservice dependency graph? Can you explain how personalization fixes this?
+
+**Common mistake:** Forgetting to normalize the personalization vector so it sums to 1. If the Ochiai scores sum to 4.7, using them directly as personalization will break the PageRank iteration (it will diverge or produce nonsensical results). Always normalize: $\mathbf{p}_i = \text{Ochiai}_i / \sum_j \text{Ochiai}_j$.
+
+#### Concept 7: Trace-Level Anomaly Classification
+
+Before you can compute Ochiai scores, you need to classify each trace as "anomalous" or "normal." This is a binary classification, and it must be done at the *trace* level, not the span level.
+
+The simplest approach (MicroRank v1): A trace is anomalous if any of its spans exceeds a threshold relative to baseline.
+
+For each service $s$, compute the baseline P95 latency from a window of normal operation. Then for a new trace, if any span's duration exceeds `2 × baseline_P95`, the entire trace is classified as anomalous.
+
+**Why trace-level, not span-level?** The Ochiai formula operates on *traces* as the unit of "pass/fail." A trace is anomalous if the user request it represents was degraded. Individual span anomalies don't map cleanly to Ochiai — you need a binary per-trace label.
+
+**Why 2× P95?** This is a heuristic. P95 means 5% of normal traces exceed this value. Doubling it means only truly abnormal traces exceed it. This threshold will need tuning, but start here.
+
+**Better approach (consider for v2):** Use multiple signals — latency, error status, and unusual call paths. A trace where the call path itself is different (e.g., a retry loop that normally doesn't happen) might be anomalous even if latency is normal.
+
+**Self-check:** You have a baseline where `payment-service` P95 latency is 200ms. You observe a trace where the `payment-service` span took 450ms. Is this trace anomalous under the 2× P95 rule? What if the baseline P95 is 300ms and the span took 450ms?
+
+**Common mistake:** Using a global threshold (e.g., "any span > 1000ms is anomalous") instead of a per-service threshold. The database might normally take 500ms for a query, while the frontend normally takes 50ms. A global threshold would miss the database anomaly and flag the frontend too aggressively.
+
+### What to Study and Where
+
+| What | Where | What to Extract |
+|---|---|---|
+| MicroRank paper, Section 3.1 | The paper itself (find on ACM DL or through your university) | How they build the Trace Coverage Tree from raw traces. This is your `build_dependency_graph()` implementation. |
+| MicroRank paper, Section 3.2 | Same | The Ochiai scoring formula and how they adapt it from software fault localization. This is your `spectrum_score()` implementation. |
+| MicroRank paper, Section 3.3 | Same | How they apply Personalized PageRank. This is your `rank_root_causes()` implementation. Note the damping factor they use and how they construct the personalization vector. |
+| NetworkX PageRank documentation | [NetworkX PageRank](https://networkx.org/documentation/stable/reference/algorithms/generated/networkx.algorithms.link_analysis.pagerank_alg.pagerank.html) | The `personalization` parameter. Understand what it expects (a dict mapping node → float, summing to 1). This is exactly what you'll pass. |
+| Spectrum-based fault localization | [SBFL survey](https://ieeexplore.ieee.org/document/6907505) or Wikipedia on "Ochiai coefficient" | Why Ochiai outperforms other SBFL formulas (Tarantula, Jaccard, etc.). You should understand why MicroRank chose Ochiai specifically. |
+
+### What to Code
+
+#### Component 1: Trace Fetcher
+
+**Purpose:** Pull traces from Jaeger's API and return them in a structured format.
+
+**Input:** Service name, time window (start time, end time)
+**Output:** List of `Trace` objects
+
+**What to understand when coding this:**
+
+The Jaeger API returns traces as JSON. Each trace has a `data` array of `TraceID` objects, each containing a `spans` array and a `processes` map. You need to:
+
+1. Call `GET /api/traces?service={service}&start={start_micros}&end={end_micros}` where `start` and `end` are Unix timestamps in **microseconds** (not milliseconds — this is a common source of bugs).
+2. Parse the response. Each span in the `spans` array has: `traceID`, `spanID`, `parentSpanID` (empty string if root), `operationName`, `startTime` (microseconds), `duration` (microseconds), `flags`, `processID`.
+3. Map `processID` to `serviceName` using the `processes` map at the trace level.
+4. Convert durations from microseconds to milliseconds.
+5. Determine span status: if any `tags` have `key="error"` and `value=true`, the span is an error. Otherwise OK.
+
+**Edge cases to handle:**
+- Jaeger returns paginated results. If `total > limit`, you need to make multiple requests with different `start` times.
+- Some spans have `parentSpanID = "0"` or `parentSpanID = ""` — both mean "root span."
+- Some traces have only one span (e.g., a health check). These are usually noise. Consider filtering them out.
+- The Jaeger API rate-limits requests. Add a small delay between requests if fetching many traces.
+
+**How to verify it works:**
+- Fetch 100 traces for `frontend` service
+- Print the first trace's span tree
+- Manually verify it in the Jaeger UI (find the same trace by trace_id)
+- Count: do you get approximately the same number of traces from the API as shown in the Jaeger UI?
+
+#### Component 2: Trace Anomaly Classifier
+
+**Purpose:** Split traces into "normal" and "anomalous" sets.
+
+**Input:** List of `Trace` objects, a baseline time window (to learn normal behavior)
+**Output:** Two lists: `anomalous_traces` and `normal_traces`
+
+**What to understand when coding this:**
+
+1. First, compute the baseline: fetch traces from the "before incident" window (e.g., the 30 minutes before the incident timestamp). For each service, compute the P95 span duration from these baseline traces. Store as `baseline_p95[service_name] = value_in_ms`.
+
+2. For each trace in the "during incident" window: check each span. If any span's duration exceeds `2 × baseline_p95[span.service_name]`, classify the entire trace as anomalous. Otherwise, normal.
+
+3. You need a minimum number of baseline traces per service (at least 50) for the P95 to be statistically meaningful. If a service has fewer than 50 spans in the baseline, fall back to the global P95 (across all services).
+
+**Why the time window matters so much:**
+
+The baseline window MUST be immediately before the incident, not from yesterday or last week. Reason: deployments change baselines. If the baseline was computed at version 1.0 and the current system is version 1.5, the P95 values might be completely different. The safest approach is a sliding window: for an incident at time T, use [T-60min, T-30min] as baseline and [T-30min, T] as the incident window. The 30-minute gap avoids contamination (the anomaly might have started slightly before the alert).
+
+**How to verify it works:**
+- With the system running normally, fetch 100 traces. Run the classifier. Result should be: ~95-100 normal, 0-5 anomalous (P95 threshold means ~5% false positives).
+- Inject latency into one service. Fetch 100 traces. Run the classifier. Result should be: a significant fraction of traces now classified as anomalous (the ones that hit the faulted service).
+- Remove the fault. Wait 10 minutes. Fetch 100 traces. Result should return to near-0 anomalous.
+
+#### Component 3: Dependency Graph Builder
+
+**Purpose:** Construct a directed, weighted graph from traces showing which services call which.
+
+**Input:** List of `Trace` objects
+**Output:** NetworkX `DiGraph` where nodes are service names and weighted edges represent call frequency
+
+**What to understand when coding this:**
+
+For each trace, iterate through its spans. For each non-root span, find its parent span. The edge is `parent.service_name → child.service_name`. Add this edge to the graph, incrementing its weight each time you observe it.
+
+After processing all traces, you have a weighted directed graph. The edge weight represents how many times this call was observed across all traces.
+
+**Important design decision: service-level vs. instance-level granularity.**
+
+Service-level: nodes are `payment-service`, `cart-service`, etc. This is simpler and what MicroRank does by default.
+Instance-level: nodes are `payment-service-pod-1`, `payment-service-pod-2`, etc. This is more precise — a single broken instance can be the root cause while the rest are healthy — but requires instance-level trace data.
+
+**Start with service-level.** Structure your code so the node identifier is a string that could be either a service name or an instance ID. When you add instance-level support in Phase 2, you only need to change how you extract the node name from the span, not the graph building logic.
+
+**How to verify it works:**
+- Build the graph from 1000 traces
+- Print the graph: `print(G.nodes())`, `print(G.edges(data=True))`
+- Compare against the Online Boutique architecture diagram. The call relationships should match.
+- The frontend should have the highest out-degree (it calls multiple services). The database should have the highest in-degree (many services call it).
+
+#### Component 4: Spectrum Scorer
+
+**Purpose:** Compute the Ochiai score for each service in the dependency graph.
+
+**Input:** Dependency graph (to get node list), anomalous traces, normal traces
+**Output:** Dictionary mapping `service_name → float` (Ochiai score, range 0.0 to 1.0)
+
+**What to understand when coding this:**
+
+For each service node in the graph:
+1. Count $n_{ef}$: how many anomalous traces contain at least one span from this service. "Contain" means there exists a span in the trace where `span.service_name == service`.
+2. Count $n_e$: how many traces (both anomalous and normal) contain this service.
+3. $n_f$ is just `len(anomalous_traces)`.
+4. Compute Ochiai: $n_{ef} / \sqrt{n_f \cdot n_e}$
+
+**Edge case:** If $n_e = 0$ (the service never appeared in any trace), Ochiai is undefined. Set the score to 0. If $n_{ef} = 0$ (the service appeared only in normal traces), the score is 0.
+
+**How to verify it works:**
+- With the system running normally, all Ochiai scores should be near 0 (because there are no/few anomalous traces).
+- Inject a fault into `cart-service`. Compute scores. `cart-service` should have the highest score. Services downstream of it should have moderate scores. Unrelated services should have low scores.
+- Inject a fault into `database`. Compute scores. `database` should have the highest score. ALL services that call the database should have moderate-to-high scores (because they're all affected). This is the "everything looks broken" scenario — PageRank in the next step will help disambiguate.
+
+#### Component 5: Personalized PageRank Ranker
+
+**Purpose:** Combine spectrum scores with graph structure to produce the final ranking.
+
+**Input:** Dependency graph, Ochiai scores dictionary
+**Output:** Ranked list of `(service_name, pagerank_score)` tuples, sorted descending
+
+**What to understand when coding this:**
+
+1. Normalize the Ochiai scores to create the personalization vector. `p[service] = ochiai[service] / sum(ochiai.values())`. Every service in the graph must have an entry (use 0 for services with no Ochiai score).
+
+2. Call NetworkX's `pagerank()`:
+```python
+ranked = nx.pagerank(
+    G,
+    alpha=0.85,                    # damping factor
+    personalization=p_vector,      # your Ochiai-based personalization
+    weight='weight',               # use edge weights (call frequency)
+    max_iter=100,                  # max iterations
+    tol=1e-06                      # convergence tolerance
+)
+```
+
+3. Sort the result by score, descending. The top service is your predicted root cause.
+
+**Why alpha=0.85?** This is the standard damping factor. It means the random surfer follows links 85% of the time and teleports 15% of the time. Lower alpha = more teleportation = personalization vector has more influence. Higher alpha = more link-following = graph structure has more influence. 0.85 is a good balance. You can experiment with 0.7–0.9 in testing.
+
+**How to verify it works:**
+- Compare PageRank results with and without personalization. Without personalization (`personalization=None`), the frontend/gateway should rank highest because it's the most connected node. With personalization, the faulted service should rank highest.
+- Test the "database failure" scenario: inject a fault into the database. Without PageRank (just Ochiai), the database and all its callers have similar scores. With PageRank, the database should rank #1 because it's upstream of all the affected services.
+
+#### Component 6: Pipeline Orchestrator
+
+**Purpose:** Tie all components together into a single `run()` call.
+
+**Input:** Incident timestamp, time window parameters
+**Output:** Final ranked list
+
+**Data flow:**
+```
+incident_time → [Trace Fetcher] → raw_traces
+                                   ↓
+raw_traces → [Anomaly Classifier] → (anomalous_traces, normal_traces)
+                                   ↓
+raw_traces → [Graph Builder] → dependency_graph
+                                   ↓
+(anomalous_traces, normal_traces, dependency_graph.nodes) → [Spectrum Scorer] → ochiai_scores
+                                   ↓
+(dependency_graph, ochiai_scores) → [PageRank Ranker] → ranked_list
+                                   ↓
+                              OUTPUT: ranked_list
+```
+
+**How to verify the full pipeline:**
+1. Run the pipeline on normal data (no fault injected). Expected: all scores near zero, no clear #1.
+2. Inject latency into `cart-service`. Run the pipeline. Expected: `cart-service` is #1.
+3. Inject CPU stress into `recommendation-service`. Run the pipeline. Expected: `recommendation-service` is #1 or #2 (CPU stress might not show up as clearly in traces since it causes slowness rather than errors — this is a Phase 2 problem).
+4. Inject latency into the `database`. Run the pipeline. Expected: `database` is #1, but several services might also score high. The key test is: is the database ranked ABOVE all the services that call it?
+
+### How the Pieces Connect
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                     Phase 1 Data Flow                            │
+│                                                                  │
+│  Jaeger API                                                      │
+│      │                                                           │
+│      ▼                                                           │
+│  Trace Fetcher ──── List[Trace] ────┬─── Anomaly Classifier     │
+│                                      │         │                 │
+│                                      │    (anomalous, normal)    │
+│                                      │         │                 │
+│                                      ├─── Graph Builder          │
+│                                      │         │                 │
+│                                      │    dependency_graph       │
+│                                      │         │                 │
+│                                      └────┬────┘                 │
+│                                           │                      │
+│                                           ▼                      │
+│                                    Spectrum Scorer                │
+│                                    (needs: anomalous,            │
+│                                     normal, graph.nodes)         │
+│                                           │                      │
+│                                           ▼                      │
+│                                    PageRank Ranker               │
+│                                    (needs: dependency_graph,     │
+│                                     ochiai_scores)               │
+│                                           │                      │
+│                                           ▼                      │
+│                                    Ranked Root Cause List        │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Understanding Checkpoints for Phase 1
+
+1. "Can I compute the Ochiai score for a service by hand, given a small set of 10 traces?" — If no, you don't understand the formula.
+2. "Can I explain why the personalization vector is needed, and what happens without it?" — If no, you don't understand Personalized PageRank.
+3. "If I inject a fault into the database and 8 out of 10 services call the database, what would the Ochiai scores look like? Which service would PageRank rank #1 and why?" — If you can't reason through this, you don't understand how the pieces interact.
+4. "Can I run my pipeline end-to-end on a real fault and get the correct answer?" — If no, something is broken. Fix it before moving on.
+
+### Common Mistakes for Phase 1
+
+1. **Not normalizing the personalization vector.** NetworkX will not error — it will just produce wrong results silently. Always verify: `sum(personalization.values())` should be ≈1.0.
+
+2. **Using the wrong time window for baseline.** If your baseline traces are from a different deployment version, your P95 values will be wrong, and your anomaly classifier will produce too many false positives or too many false negatives. Always use a sliding window relative to the incident.
+
+3. **Building the dependency graph from documentation.** The real graph should come from observed traces. Documentation says "A calls B" but maybe A only calls B in 5% of requests. The edge weight matters for PageRank.
+
+4. **Forgetting to handle the "everything looks broken" case.** When the database fails, almost every service looks anomalous. Your tool should still correctly identify the database as the root cause, not just list all services as equally suspicious. PageRank should handle this if your personalization vector is correct, but it's worth explicitly testing.
+
+---
+
+## Phase 2: Multi-Modal Fusion — Adding Metrics as a Second Signal
+
+### Real Objective
+
+You are giving your detective a second type of evidence. In Phase 1, the detective only had witness statements (traces). Now, the detective also gets medical records (metrics). A service can look fine in the traces (latency is normal) but be sick in the metrics (CPU is at 99%, memory is leaking). By combining both signals, you catch problems that traces alone miss, and you reduce false positives (a service with high trace anomaly but normal metrics might just be a victim, not a root cause).
+
+The real-world impact: Phase 1 can detect latency injection and error spikes (these show up in traces). Phase 2 can additionally detect CPU exhaustion, memory leaks, disk saturation, and connection pool exhaustion (these show up in metrics but not always in traces). The Black Friday scenario from your plan — inventory service's connection pool exhaustion — is a metric-only signal that Phase 1 would miss.
+
+### Tool Objective
+
+By the end of Phase 2, the tool must:
+1. Detect metric anomalies per service (CPU, memory, latency, error rate)
+2. Fuse trace-based scores and metric-based scores into a single ranking
+3. Correctly identify root causes that only manifest in metrics (e.g., CPU stress without latency increase)
+4. Pass a 5-scenario fault injection test suite with ≥4/5 correct in top-3
+
+### What You Must Understand Before Coding
+
+#### Concept 8: Z-Score Anomaly Detection on Time Series
+
+A z-score measures how many standard deviations a data point is from the mean:
+
+$$z = \frac{x - \mu}{\sigma}$$
+
+Where $x$ is the current value, $\mu$ is the baseline mean, and $\sigma$ is the baseline standard deviation.
+
+**Interpretation:**
+- $|z| > 2$: unusual (5% chance under normal distribution) — mild anomaly
+- $|z| > 3$: very unusual (0.3% chance) — strong anomaly
+- $|z| > 5$: almost certainly not normal — critical anomaly
+
+**Why not just use fixed thresholds?** Because "CPU at 80%" might be normal during peak traffic but anomalous at 3 AM. Z-scores are relative to the service's own baseline, so they automatically adapt.
+
+**How to compute the baseline:**
+1. For each (service, metric) pair, collect the metric values from the baseline window (e.g., the 60 minutes before the incident).
+2. Compute $\mu$ = mean of baseline values.
+3. Compute $\sigma$ = standard deviation of baseline values.
+4. If $\sigma = 0$ (metric never changed during baseline — common for counters), fall back to a small epsilon like 0.001 to avoid division by zero. Better yet, use MAD (Median Absolute Deviation) instead of standard deviation, which is more robust to outliers.
+
+**Self-check:** A service's CPU usage baseline is $\mu = 45\%$, $\sigma = 8\%$. During the incident, CPU is at 78%. What's the z-score? Is it anomalous? Answer: $z = (78 - 45) / 8 = 4.125$. Yes, strongly anomalous (> 3).
+
+**Common mistake:** Computing the z-score using the current window's own mean and standard deviation instead of the baseline's. If the anomaly is already happening, the current mean will be skewed high, making the z-score look normal. Always use the baseline period's statistics.
+
+#### Concept 9: Metric Types and PromQL Patterns You Will Need
+
+You will need to write PromQL queries for four key metrics per service. Here are the exact patterns:
+
+**1. CPU Usage (Counter → rate)**
+```promql
+# CPU usage as a percentage of container limit
+100 * rate(container_cpu_usage_seconds_total{container!="POD", namespace="default"}[5m])
+  / on(pod) kube_pod_container_resource_limits{resource="cpu"}
+```
+This is a counter, so you must use `rate()`. The `[5m]` window smooths out short fluctuations.
+
+**2. Memory Usage (Gauge → direct)**
+```promql
+# Memory as a percentage of container limit
+100 * container_memory_working_set_bytes{container!="POD", namespace="default"}
+  / on(pod) kube_pod_container_resource_limits{resource="memory"}
+```
+This is a gauge, so you can read it directly.
+
+**3. HTTP Latency (Histogram → percentile)**
+```promql
+# P95 latency per service
+histogram_quantile(0.95,
+  sum(rate(http_server_request_duration_seconds_bucket{namespace="default"}[5m]))
+    by (le, service)
+)
+```
+This uses `histogram_quantile()` on histogram buckets. The `le` label ("less than or equal") is required. The `sum(...) by (le, service)` ensures you aggregate correctly across instances before computing the percentile.
+
+**4. Error Rate (Counter → rate of errors / rate of total)**
+```promql
+# Error rate as a percentage
+100 * sum(rate(http_server_requests_total{status=~"5..", namespace="default"}[5m]))
+    by (service)
+  / sum(rate(http_server_requests_total{namespace="default"}[5m]))
+    by (service)
+```
+This is a ratio of two counters. Both the numerator (5xx errors) and denominator (all requests) must use `rate()`. Never divide raw counters.
+
+**Self-check:** Can you explain why `rate()` is needed for CPU and error rate but not for memory? Can you explain what the `le` label does in a histogram? Can you explain why you divide `rate(errors)` by `rate(total)` instead of dividing raw `errors` by raw `total`?
+
+**Common mistake:** Forgetting the `by (le, ...)` grouping in `histogram_quantile()`. Without it, the `le` bucket boundaries get mixed across services, producing incorrect percentiles.
+
+#### Concept 10: Multi-Modal Score Fusion
+
+You now have two anomaly signals per service:
+- **Trace score**: Ochiai score (0–1), measuring "how associated is this service with anomalous traces"
+- **Metric score**: maximum z-score across all metrics for this service, normalized to 0–1
+
+The simplest fusion is a weighted linear combination:
+
+$$\text{fused}(s) = \alpha \cdot \text{trace\_score}(s) + \beta \cdot \text{metric\_score}(s) + \gamma \cdot \text{graph\_centrality}(s)$$
+
+Where $\alpha + \beta + \gamma = 1$, and $\gamma$ is a small weight for graph centrality (how many other services depend on this one — a service with many dependents is a more impactful root cause).
+
+**How to normalize metric z-scores to 0–1:** Use a sigmoid or clipping function. Z-scores can be unbounded, but you want them on the same scale as Ochiai scores. A practical approach:
+
+$$\text{metric\_score}(s) = \min\left(\frac{\max\_z(s)}{5.0}, 1.0\right)$$
+
+This clips the max z-score to the range [0, 1], where a z-score of 5.0 maps to 1.0 (maximum anomaly). Adjust the 5.0 divisor based on your data.
+
+**How to compute graph centrality:** Use PageRank with uniform personalization (no Ochiai weighting). This gives you a "structural importance" score that's independent of the anomaly signals.
+
+**How to set the weights (α, β, γ):**
+- Start with α=0.4, β=0.4, γ=0.2 (equal weight to trace and metric, small graph weight).
+- Run your fault injection test suite with these weights.
+- If your tool misses metric-only faults (like CPU stress), increase β.
+- If your tool misses trace-only faults (like latency injection with normal metrics), increase α.
+- Lock in the weights once you hit ≥4/5 accuracy.
+
+**Self-check:** If a service has a high Ochiai score (0.9) but low metric scores (all z-scores < 1), what does that mean? Is it the root cause or a victim? Answer: It could be a victim — its traces are anomalous because an upstream service failed, but its own resources are fine. The metric signal acts as a "confirming witness." Low metric scores should reduce confidence. This is why fusion helps — it reduces false positives.
+
+**Common mistake:** Treating fusion as the final step. It's not — you still need to run PageRank on the fused scores. The fusion replaces the Ochiai-only personalization vector with a fused personalization vector. PageRank then adjusts the fused scores based on graph structure.
+
+### What to Study and Where
+
+| What | Where | What to Extract |
+|---|---|---|
+| CHASE paper, Section III-B | [CHASE (2024)](https://arxiv.org/abs/2406.19711) | How they construct the multimodal invocation graph. Focus on how metric nodes attach to service nodes. |
+| CHASE paper, Section III-C | Same | How heterogeneous message passing works. You'll implement a simplified version: metric anomaly scores "flow up" to service nodes. |
+| Prometheus HTTP API | [Prometheus Querying API](https://prometheus.io/docs/prometheus/latest/querying/api/) | The `GET /api/v1/query` and `GET /api/v1/query_range` endpoints. You'll call these to fetch metric data. Understand `query`, `start`, `end`, `step` parameters. |
+| Time series anomaly detection | Any introductory statistics resource covering z-scores, MAD, and IQR methods | Understand when z-scores fail (non-normal distributions) and when MAD is better. You'll implement both. |
+
+### What to Code
+
+#### Component 7: Prometheus Metric Fetcher
+
+**Purpose:** Query Prometheus for metric time series data.
+
+**Input:** Service name, metric name, time range
+**Output:** Time series as a list of (timestamp, value) tuples
+
+**What to understand when coding this:**
+
+The Prometheus HTTP API has two main endpoints:
+- `GET /api/v1/query?query={promql}` — instant query at a single point in time
+- `GET /api/v1/query_range?query={promql}&start={start}&end={end}&step={step}` — range query over a time interval
+
+For anomaly detection, you need `query_range` to get the time series history. Use `step=60s` (one data point per minute — sufficient for anomaly detection without excessive data volume).
+
+**Important:** The response format is:
+```json
+{
+  "data": {
+    "result": [
+      {
+        "metric": {"service": "cart-service", "instance": "10.0.0.1:8080"},
+        "values": [[1609459200, "45.2"], [1609459260, "47.1"], ...]
+      }
+    ]
+  }
+}
+```
+Each entry in `values` is `[unix_timestamp, string_value]`. Parse the string value to float. If the result has multiple series (e.g., one per pod), average them for a service-level view.
+
+#### Component 8: Metric Anomaly Detector
+
+**Purpose:** Detect which metrics are anomalous for each service.
+
+**Input:** Service name, baseline time window, incident time window
+**Output:** Dictionary mapping `metric_name → anomaly_score` for the service
+
+**What to understand when coding this:**
+
+For each of the four key metrics (CPU, memory, latency, error rate):
+1. Fetch the baseline time series using the Metric Fetcher
+2. Compute $\mu$ and $\sigma$ (or MAD) from the baseline
+3. Fetch the current/incident time series
+4. For each data point in the current series, compute the z-score
+5. The anomaly score for this metric = maximum z-score observed in the incident window
+
+Using MAD instead of σ for robustness:
+$$\text{MAD} = \text{median}(|x_i - \text{median}(x)|)$$
+$$z_{\text{robust}} = \frac{x - \text{median}(x)}{1.4826 \cdot \text{MAD}}$$
+
+The 1.4826 factor makes MAD comparable to σ for normally distributed data. Use MAD when your baseline data has outliers (e.g., occasional spikes that aren't real anomalies).
+
+**How to verify it works:**
+- With the system running normally, all z-scores should be < 2 for all services.
+- Inject CPU stress into a service. The CPU z-score for that service should exceed 3.
+- Inject network latency. The latency z-score for the affected service should exceed 3, but CPU should remain normal.
+- Inject a pod crash. The error rate z-score should spike for the affected service.
+
+#### Component 9: Fused Scorer
+
+**Purpose:** Combine trace scores and metric scores into a single anomaly score per service.
+
+**Input:** Per-service Ochiai scores, per-service metric anomaly scores, dependency graph
+**Output:** Fused anomaly score per service, normalized for use as PageRank personalization
+
+**What to understand when coding this:**
+
+1. For each service, collect:
+   - `trace_score` = Ochiai score from Phase 1
+   - `metric_score` = normalized max z-score from the Metric Anomaly Detector
+   - `graph_score` = PageRank with uniform personalization (just structural importance)
+
+2. Normalize each to [0, 1] range.
+
+3. Compute: `fused_score = α * trace_score + β * metric_score + γ * graph_score`
+
+4. Normalize the fused scores to sum to 1 (for use as PageRank personalization vector).
+
+5. Run Personalized PageRank with the fused personalization vector.
+
+**How this differs from Phase 1:** In Phase 1, the personalization vector was based solely on Ochiai scores. Now it's based on a combination of trace anomaly, metric anomaly, and structural importance. This means a service with moderate trace anomaly but strong metric anomaly can rank higher than a service with only trace anomaly.
+
+#### Component 10: Fault Injection Test Suite
+
+**Purpose:** Systematically test your tool against known failure scenarios.
+
+**Input:** List of fault scenarios (each with: fault type, target service, injection command, expected root cause)
+**Output:** Test results (accuracy, top-1, top-3, per-scenario breakdown)
+
+**What to understand when coding this:**
+
+Define at least 5 scenarios covering different failure types:
+
+1. **Network latency**: `tc qdisc add dev eth0 root netem delay 500ms` on one service pod. Tests: Does the tool catch latency-only faults? (Trace signal should be strong, metric signal weak.)
+
+2. **CPU stress**: `stress-ng --cpu 4 --timeout 300s` on one service pod. Tests: Does the tool catch resource-only faults? (Metric signal should be strong, trace signal may be weak if the service doesn't slow down enough to trigger trace anomalies.)
+
+3. **Partial outage**: Scale a deployment to 1 replica (from 3). Tests: Does the tool catch capacity faults? (Both signals — increased latency and increased errors.)
+
+4. **Error injection**: Modify environment variable to introduce errors. Tests: Does the tool catch software faults? (Error rate spike in metrics, error status in traces.)
+
+5. **Database contention**: Run a query-heavy workload against the database. Tests: Does the tool handle the "everything looks broken" case where a shared dependency fails? (Many services should show anomalies, but the database should rank #1.)
+
+For each scenario:
+1. Record the expected root cause service
+2. Run the injection
+3. Wait 5 minutes for propagation
+4. Run the full pipeline
+5. Record the ranked output
+6. Clean up the injection
+7. Wait 10 minutes for recovery
+
+**How to evaluate:**
+- **Top-1 accuracy**: Is the expected root cause the #1 ranked service?
+- **Top-3 accuracy**: Is the expected root cause in the top 3?
+- Target: ≥60% top-1, ≥80% top-3 across all scenarios
+
+### Understanding Checkpoints for Phase 2
+
+1. "Can I write a PromQL query for the P95 latency of any service from memory?" — If no, study PromQL more.
+2. "Can I explain why a CPU stress fault might NOT show up in traces?" — If no, you don't understand the limitation of trace-only analysis. (CPU stress causes slowness, but if the service's latency is still within the 2× P95 threshold, the trace classifier won't flag it.)
+3. "Can I explain why metric anomalies alone are insufficient?" — If no, you don't understand why fusion is needed. (Metric anomalies can't distinguish root cause from victim — when the database fails, all services show high latency, but only the database is the root cause. The dependency graph from traces provides the causal structure.)
+4. "Does my tool correctly identify the root cause in at least 4 out of 5 fault scenarios?" — If no, tune thresholds and weights before moving on.
+
+---
+
+## Phase 3: Temporal Causal Graph — From Correlation to Causation
+
+### Real Objective
+
+Phase 2 tells you "which services are anomalous." Phase 3 tells you "which service CAUSED the others to become anomalous." This is the difference between a symptom list and a diagnosis. When the database fails and 8 services show high latency, Phase 2 gives you 8 suspicious services. Phase 3 gives you 1 root cause and 7 victims, connected by a causal chain that explains exactly how the failure propagated.
+
+The key insight: the dependency graph (from traces) already encodes the structural constraint — "Service A *can* cause Service B if A calls B." During an incident, you only need to answer "Did it actually cause it this time?" You don't need to discover causality from scratch — you only need to **prune** the dependency graph to the edges that were active during the incident, using two signals:
+
+1. **Temporal precedence** — the upstream service became anomalous strictly before the downstream service
+2. **Cross-correlation lag** — the upstream metric spike predicts the downstream metric spike with a consistent time delay
+
+Neither assumes stationarity across the whole incident. Both work on the transient transition period.
+
+### Tool Objective
+
+By the end of Phase 3, the tool must:
+1. Detect the exact time each service became anomalous (anomaly onset time) using changepoint detection
+2. Use cross-correlation lag analysis to determine which dependency edges were causally active during the incident
+3. Construct a causal graph (a pruned subgraph of the dependency graph, showing only causally active edges)
+4. Use the causal graph to trace the propagation path from root cause to all affected services
+5. Output a propagation path (not just a ranked list) showing the chain of causation with timing evidence
+
+### What You Must Understand Before Coding
+
+#### Concept 11: Anomaly Onset Detection via Changepoint Detection
+
+This is the problem of finding the exact moment a metric transitioned from "normal" to "anomalous." It's a **changepoint detection** problem.
+
+**Why not z-score thresholding?** Z-scores compare individual points against a global baseline. During gradual failures (memory leaks, connection pool exhaustion), the z-score may not cross 3σ for minutes or hours after the problem started. The threshold-crossing point is not the onset point — it's just when the anomaly became severe enough to trigger.
+
+**Use the PELT algorithm** (Pruned Exact Linear Time) from the `ruptures` library. It detects the single point where the statistical properties of the time series change (mean, variance, or both). It finds the onset at the beginning of the shift, not when it crosses a magic threshold.
+
+```python
+import ruptures as rpt
+import numpy as np
+
+def detect_onset(metric_series: np.ndarray, 
+                 baseline_window: int = 60) -> int | None:
+    """
+    metric_series: 1D array of metric values, 1 value per minute.
+    baseline_window: number of points assumed normal at start.
+    
+    Uses PELT to find the single changepoint where the mean shifts.
+    """
+    algo = rpt.Pelt(model="l2", min_size=3).fit(metric_series)
+    change_points = algo.predict(pen=10)
+    
+    # The first changepoint after the baseline window
+    for cp in change_points:
+        if cp > baseline_window:
+            return cp
+    return None
+```
+
+**Why this matters:** The entire causal inference in Phase 3 depends on accurate onset times. If service A's onset is 02:12:17 and service B's onset is 02:14:03, you can conclude A likely caused B (2 minutes of propagation time is reasonable). But if your onset detection is off by ±5 minutes, you might conclude B caused A, which is wrong.
+
+**Self-check:** A memory leak starts at 02:12 and grows linearly for 20 minutes. Z-score detection might not trigger until 02:18 (when it crosses 3σ). PELT detects the shift at ~02:13 because the mean of the series changes at 02:12. Your propagation delays will be far more accurate.
+
+**Common mistake:** Using coarse-grained time windows (e.g., 5-minute buckets) for onset detection. If services A and B both became anomalous "within the same 5-minute window," you can't determine which came first. Use 1-minute or 30-second granularity.
+
+#### Concept 12: Cross-Correlation Lag (Replaces Granger Causality)
+
+Instead of Granger causality, compute the **cross-correlation** between the upstream metric and the downstream metric at different time lags. If the maximum correlation occurs at a positive lag (upstream leads downstream), and the correlation is strong, the edge is causally active.
+
+**Confidence note:** Cross-correlation detects linear shape similarity. It works well for pulse-to-pulse and ramp-to-ramp propagation (the majority of incidents). It may underperform on non-linear relationships (e.g., a memory leak causing erratic GC pauses that produce jagged, non-repeating latency spikes downstream). To handle this, we run **Spearman rank correlation** in parallel as a secondary check. Spearman detects monotonic but non-linear relationships — where upstream goes up, downstream goes up, even if the shapes aren't identical.
+
+```python
+from scipy.signal import correlate
+from scipy.stats import spearmanr
+import numpy as np
+
+def edge_is_causally_active(upstream_series: np.ndarray,
+                            downstream_series: np.ndarray,
+                            max_lag_minutes: int = 10) -> dict:
+    """
+    Returns a dict with:
+      - is_active: bool
+      - lag_minutes: int
+      - pearson_corr: float
+      - spearman_corr: float
+      - best_metric_pair: tuple (set by caller in all-pairs loop)
+    
+    upstream_series: metric values for the upstream service (e.g., DB CPU)
+    downstream_series: metric values for the downstream service (e.g., payment latency)
+    """
+    # Normalize both series to zero mean, unit variance
+    u = (upstream_series - np.mean(upstream_series)) / np.std(upstream_series)
+    d = (downstream_series - np.mean(downstream_series)) / np.std(downstream_series)
+    
+    # Compute cross-correlation at lags -max_lag to +max_lag
+    correlation = correlate(d, u, mode='full')
+    lags = np.arange(-len(u) + 1, len(d))
+    
+    # Focus only on positive lags (upstream leads downstream)
+    positive_mask = lags > 0
+    positive_lags = lags[positive_mask]
+    positive_corr = correlation[positive_mask]
+    
+    # Find the lag with maximum correlation
+    best_idx = np.argmax(positive_corr)
+    best_lag = positive_lags[best_idx]
+    pearson_corr = positive_corr[best_idx] / (len(u) * np.std(u) * np.std(d))
+    
+    # Spearman rank correlation at the best lag (detects non-linear monotonic relationships)
+    if best_lag < len(u):
+        u_shifted = u[:-best_lag] if best_lag > 0 else u
+        d_shifted = d[best_lag:] if best_lag > 0 else d
+        min_len = min(len(u_shifted), len(d_shifted))
+        spearman_corr, _ = spearmanr(u_shifted[:min_len], d_shifted[:min_len])
+    else:
+        spearman_corr = 0.0
+    
+    # Activation thresholds:
+    # Pearson > 0.6 = strong linear shape match
+    # Spearman > 0.7 = strong monotonic (non-linear) match
+    is_active = (
+        (pearson_corr > 0.6) or 
+        (spearman_corr > 0.7)
+    ) and (best_lag <= max_lag_minutes)
+    
+    return {
+        'is_active': is_active,
+        'lag_minutes': int(best_lag),
+        'pearson_corr': float(pearson_corr),
+        'spearman_corr': float(spearman_corr),
+    }
+```
+
+**Why this works without stationarity:** You're only looking for a **relative lead-lag relationship** within a short window (10–20 minutes). By z-scoring the window locally, you remove the worst of the regime shift. The correlation measures shape similarity, not absolute levels. If DB CPU spikes in a pulse and payment latency spikes with the same pulse shape 2 minutes later, cross-correlation finds it regardless of the absolute values.
+
+**Why 0.6 Pearson / 0.7 Spearman thresholds?** During fault injection testing, you'll see edges with true propagation show Pearson correlations of 0.7–0.95. Spurious edges (services that happen to be affected by the same root cause but don't directly cause each other) show correlations of 0.1–0.4. The gap is wide enough that 0.6 is a safe starting point. Spearman uses 0.7 because rank correlation tends to produce higher baseline values — the threshold needs to be stricter to avoid false positives.
+
+**Confidence note:** These thresholds are starting points. They may need tuning based on your specific system's metric noise levels. The Phase 2 fault injection test suite is where you validate and adjust them.
+
+**Self-check:** DB CPU series: `[10, 12, 11, 50, 55, 52, 48, 45, ...]`. Payment latency series: `[20, 22, 21, 23, 45, 55, 52, 50, ...]`. What is the lag? Answer: ~3 minutes. DB spikes at index 3; payment latency spikes at index 5. The cross-correlation should peak at lag=2. The edge `database → payment-service` is marked active.
+
+**Why cross-correlation beats Granger for this use case:**
+
+| Property | Granger Causality | Cross-Correlation Lag |
+|---|---|---|
+| Stationarity assumption | Required (fatal during incidents) | Not required (works on short windows) |
+| Non-linear relationships | Cannot detect | Spearman catches monotonic non-linear |
+| Computational cost | High (fits AR models per edge) | Low (FFT-based correlation) |
+| Interpretability | P-values are abstract | Lag in minutes is concrete |
+| Robustness to noise | Poor | Moderate (threshold filters noise) |
+| False positive rate | High (spurious causality) | Low (structural graph constrains tests) |
+
+Granger assumes the generating process is stable; an incident is literally the moment the process becomes unstable. Running Granger on a shifting distribution gives you p-values that are essentially random numbers. Cross-correlation gives you 90% of the causal pruning power with 10% of the complexity and none of the statistical fragility.
+
+#### Concept 12b: All-Pairs Metric Cross-Correlation
+
+**Confidence note:** The "dominant metric" heuristic (picking the single metric with the highest z-score per service) is simple but can miss cross-metric propagation signals. For example: database CPU spikes to 99%, but payment-service doesn't show CPU stress — it shows **latency spikes** because it's waiting on slow DB queries. If you pair DB's dominant metric (CPU) with payment's dominant metric (latency), you catch it. But if payment's dominant metric happens to be error_rate (because the latency caused timeouts), you'd pair DB CPU with payment error_rate and miss the signal.
+
+**Solution: Run cross-correlation on all metric pairs between two services and take the best result.**
+
+```python
+def get_best_correlation_between_services(
+    upstream_metrics: dict[str, np.ndarray],
+    downstream_metrics: dict[str, np.ndarray],
+    max_lag_minutes: int = 10
+) -> dict:
+    """
+    Run cross-correlation on all metric pairs (upstream × downstream).
+    Returns the best result across all pairs.
+    
+    upstream_metrics: {"cpu": [...], "latency": [...], "error_rate": [...], "memory": [...]}
+    downstream_metrics: same structure
+    """
+    best_result = {
+        'is_active': False,
+        'lag_minutes': 0,
+        'pearson_corr': 0.0,
+        'spearman_corr': 0.0,
+        'best_metric_pair': None,
+    }
+    
+    for u_name, u_series in upstream_metrics.items():
+        for d_name, d_series in downstream_metrics.items():
+            result = edge_is_causally_active(u_series, d_series, max_lag_minutes)
+            
+            # Use the maximum of Pearson and Spearman as the comparison metric
+            combined_score = max(result['pearson_corr'], result['spearman_corr'])
+            best_combined = max(best_result['pearson_corr'], best_result['spearman_corr'])
+            
+            if combined_score > best_combined:
+                best_result = {**result, 'best_metric_pair': (u_name, d_name)}
+    
+    return best_result
+```
+
+This is 4×4 = 16 cross-correlation calls per edge (4 metrics × 4 metrics). With ~50 edges in Online Boutique, that's ~800 calls — trivial compute for a one-time analysis. You also get bonus output: *which metric pair* carried the signal, which is valuable evidence for the reasoning path ("DB CPU predicted payment latency with r=0.89 at lag=2min").
+
+**Confidence note:** If your system exposes more than 4 key metrics per service (e.g., connection pool usage, thread pool saturation, disk I/O), the all-pairs approach scales quadratically. For N metrics per service, it's N² calls per edge. If N > 10, consider switching to the "composite anomaly signal" alternative: create a single time series per service by taking the max normalized z-score across all metrics at each timestamp, then cross-correlate the composites. This is O(1) per edge but loses the "which metric pair" interpretability.
+
+#### Concept 12c: Per-Edge Lag Windows from Trace Data
+
+**Confidence note:** A fixed `max_lag_minutes=10` works for synchronous HTTP/gRPC architectures like Online Boutique. But if your tool is meant to work on systems with message queues (Kafka, SQS, RabbitMQ) or batch jobs, messages can sit in queues for 20+ minutes before being consumed. A fixed window would miss those edges.
+
+**Solution: Infer per-edge lag windows from the trace data you already collected in Phase 1.**
+
+```python
+def compute_edge_lag_windows(traces: list[Trace]) -> dict[tuple[str, str], float]:
+    """
+    For each edge in the dependency graph, compute the P99 span duration
+    from trace data. Use this to set a per-edge max_lag_minutes.
+    
+    Synchronous edges (fast RPCs) get ~1-2 minute windows.
+    Async edges (queue-based, batch) get 15-30 minute windows.
+    """
+    edge_durations: dict[tuple[str, str], list[float]] = {}
+    
+    for trace in traces:
+        spans_by_id = {s.span_id: s for s in trace.spans}
+        for span in trace.spans:
+            if span.parent_id and span.parent_id in spans_by_id:
+                parent = spans_by_id[span.parent_id]
+                edge = (parent.service_name, span.service_name)
+                edge_durations.setdefault(edge, []).append(span.duration_ms)
+    
+    edge_lag_windows = {}
+    for edge, durations in edge_durations.items():
+        p99 = np.percentile(durations, 99)
+        # Convert ms to minutes, multiply by 10 for safety margin
+        # Minimum 1 minute, maximum 30 minutes
+        lag_minutes = max(1.0, min(30.0, (p99 / 1000 / 60) * 10))
+        edge_lag_windows[edge] = lag_minutes
+    
+    return edge_lag_windows
+```
+
+**How it works:** If `frontend → cart-service` has a P99 span duration of 200ms, the lag window is `max(1, min(30, 0.003 * 10))` = 1 minute. If `cart-service → email-service` (async, via queue) has a P99 of 120 seconds, the lag window is `max(1, min(30, 2 * 10))` = 20 minutes.
+
+**Confidence note:** The `* 10` safety multiplier is a heuristic. During testing, you may find that some async edges need a larger multiplier (e.g., if messages batch every 30 minutes). The adaptive expansion fallback below handles cases where the trace-derived window is too short.
+
+**Fallback: Adaptive expansion**
+If no signal is found within the trace-derived lag window, expand to 30 minutes. If correlation is found at 25 minutes, keep the edge but downgrade confidence to "low" and flag "long propagation delay — possible async dependency or queue backlog."
+
+#### Concept 13: The Causal Graph vs. The Dependency Graph
+
+The **dependency graph** (from Phase 1) shows all possible call relationships. It's built from traces and represents "service A *can* call service B."
+
+The **causal graph** (from Phase 3) shows only the call relationships that were **active during the incident** and through which the anomaly actually propagated. It represents "service A's anomaly *caused* service B's anomaly *in this specific incident*."
+
+The causal graph is always a **subgraph** of the dependency graph. Not every dependency edge is causally active during every incident. If the database fails, the edge `frontend → email-service` might not be causally active (emails might still work fine if they use a different database). Only the edges through which the anomaly propagated should appear in the causal graph.
+
+**How to build it:**
+
+1. Start with the dependency graph from Phase 1.
+2. For each edge (A → B) in the dependency graph:
+   a. Check temporal precedence: did A become anomalous before B? If no → remove the edge (B can't have been caused by A if B was already anomalous).
+   b. Check cross-correlation lag: does A's metric spike predict B's metric spike with a positive lag and correlation > 0.6? If no → this edge has no statistical support for causation.
+   c. If BOTH conditions hold → keep the edge as a "high confidence" causal edge.
+   d. If only temporal precedence holds → keep the edge as a "low confidence" causal edge (the anomaly likely propagated but the metric relationship is noisy or non-linear).
+   e. If NEITHER holds → remove the edge.
+3. The resulting graph is your causal graph.
+
+**Why this matters:** The causal graph is what powers your propagation path display. Instead of showing all possible connections, you show only the chain of causation. This is what an SRE needs to see: "inventory-service broke → database was affected → payment-service timed out → cart-service failed → frontend showed errors."
+
+**Self-check:** Given a dependency graph with edges A→B, A→C, B→C, and B→D. During an incident, anomaly onsets are: A at 02:12, B at 02:14, C at 02:15, D at 02:16. Cross-correlation confirms A→B, B→D, but NOT A→C and NOT B→C. What does the causal graph look like? Answer: Edges A→B (high confidence, temporal + correlation), B→D (high confidence), no edge A→C (no correlation support), no edge B→C (no correlation support). C's anomaly is unexplained by this graph — it might be caused by an unobserved factor or a different root cause.
+
+### What to Study and Where
+
+| What | Where | What to Extract |
+|---|---|---|
+| OCEAN paper, Sections 3.1-3.2 | [OCEAN (2024)](https://arxiv.org/abs/2410.10021) | How they use temporal dependencies for causal graph learning. You'll implement a simplified version: cross-correlation lag + temporal ordering instead of neural approaches. |
+| PELT changepoint detection | [ruptures library docs](https://centre-borelli.github.io/ruptures-docs/) | The `Pelt` algorithm API, `model="l2"` for mean shift detection, and `pen` parameter tuning. |
+| Cross-correlation | [scipy.signal.correlate docs](https://docs.scipy.org/doc/scipy/reference/generated/scipy.signal.correlate.html) | The API, `mode='full'`, and how to interpret lag indices. |
+| Spearman rank correlation | [scipy.stats.spearmanr docs](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.spearmanr.html) | The API, how it differs from Pearson, and why it catches monotonic non-linear relationships. |
+| Transfer Entropy (optional, Phase 3b) | [pyinform docs](https://github.com/buotexas/pyinform) or [IDTxl library](https://github.com/pwollstadt/IDTxl) | Only study this if your Phase 3 test suite reveals specific fault types that both Pearson and Spearman miss. |
+
+### What to Code
+
+#### Component 11-Revised: Anomaly Onset Detector
+
+**Purpose:** Find the exact timestamp when each service's key metric distribution shifted from normal to anomalous.
+
+**Input:** Service name, metric name, baseline window, incident window
+**Output:** Anomaly onset timestamp (or None if the service never became anomalous)
+
+**What to understand when coding this:**
+
+1. Fetch the metric time series for the baseline and incident windows.
+2. Run PELT changepoint detection on the combined series.
+3. Find the first changepoint after the baseline window — that's the onset.
+4. For each service, detect onset across multiple metrics (CPU, memory, latency, error rate). The earliest onset across all metrics is the service's anomaly onset time.
+
+**How to verify it works:**
+- Inject a fault at a known time (e.g., 02:10:00). Run the onset detector. The detected onset should be within ±2 minutes of the actual injection time.
+- Test with a gradual failure (e.g., memory leak). PELT should detect the onset at the start of the leak, not when it becomes severe.
+- Test with multiple services: inject a fault that cascades (e.g., database failure). The database's onset should be earlier than any service that depends on it.
+
+#### Component 12-Revised: Cross-Correlation Lag Computer
+
+**Purpose:** Test whether one service's anomaly shape predicts another's with a time delay, across all metric pairs.
+
+**Input:** Pair of services (A, B), all metric time series per service, per-edge lag window
+**Output:** Dict with is_active, lag_minutes, pearson_corr, spearman_corr, best_metric_pair
+
+**What to understand when coding this:**
+
+1. For services A and B, fetch their metric time series over the incident window (plus a 10-minute buffer before the earliest anomaly onset).
+2. Use the per-edge lag window computed from trace data (Concept 12c), not a fixed global value.
+3. Run `get_best_correlation_between_services()` to test all metric pairs (CPU↔CPU, CPU↔latency, latency↔CPU, latency↔latency, etc.).
+4. The function returns the best result across all pairs, including which metric pair carried the signal.
+5. If `is_active` is true, the edge is causally active.
+
+**Confidence note:** The all-pairs approach assumes each service exposes 4 key metrics (CPU, memory, latency, error rate). If your system exposes more, see Concept 12b for the quadratic scaling concern and the composite signal fallback.
+
+**Edge cases:**
+- If either time series has < 10 data points, cross-correlation is unreliable. Return `is_active=False`.
+- If both time series are constant (no variation), return `is_active=False`.
+- If the time series are identical (perfectly correlated), the lag will be 0. This means simultaneous onset — keep as low-confidence edge.
+
+**How to verify it works:**
+- Inject a fault into service A and observe it propagate to service B. Compute cross-correlation A→B. Expected: active with lag matching observed propagation time. The `best_metric_pair` should reflect the actual propagation mechanism (e.g., `("cpu", "latency")` if A's CPU stress causes B's latency increase).
+- Compute cross-correlation B→A. Expected: not active (B's anomaly doesn't lead A's — A happened first and is upstream).
+- Test an async edge (e.g., cart-service → email-service via queue). The per-edge lag window should be larger than for sync edges, and the correlation should still be detected.
+
+#### Component 13-Revised: Causal Graph Builder
+
+**Purpose:** Construct the causal graph from the dependency graph, temporal ordering, and cross-correlation results.
+
+**Input:** Dependency graph, anomaly onset times per service, metric time series per service, per-edge lag windows (from trace data)
+**Output:** Causal graph (NetworkX DiGraph with confidence-labeled edges)
+
+**What to understand when coding this:**
+
+```python
+def build_causal_graph(dependency_graph: nx.DiGraph,
+                       anomaly_onsets: dict[str, datetime],
+                       metric_series: dict[str, dict[str, np.ndarray]],
+                       edge_lag_windows: dict[tuple[str, str], float]) -> nx.DiGraph:
+    causal_graph = nx.DiGraph()
+    causal_graph.add_nodes_from(dependency_graph.nodes())
+    
+    for u, v in dependency_graph.edges():
+        # Condition 1: Temporal precedence
+        u_onset = anomaly_onsets.get(u)
+        v_onset = anomaly_onsets.get(v)
+        temporal_valid = (u_onset is not None and 
+                       v_onset is not None and 
+                       u_onset < v_onset)
+        
+        # Condition 2: All-pairs cross-correlation lag
+        max_lag = edge_lag_windows.get((u, v), 10.0)  # fallback to 10 min if no trace data
+        
+        result = get_best_correlation_between_services(
+            metric_series[u], metric_series[v], max_lag
+        )
+        
+        if temporal_valid and result['is_active']:
+            causal_graph.add_edge(u, v, 
+                                  confidence='high', 
+                                  lag_minutes=result['lag_minutes'],
+                                  pearson_corr=result['pearson_corr'],
+                                  spearman_corr=result['spearman_corr'],
+                                  best_metric_pair=result['best_metric_pair'])
+        elif temporal_valid:
+            # Anomaly flowed from u to v, but metrics don't correlate strongly
+            # Could be: async messaging, non-linear propagation, or noisy data
+            causal_graph.add_edge(u, v, 
+                                  confidence='low', 
+                                  lag_minutes=None,
+                                  pearson_corr=result['pearson_corr'],
+                                  spearman_corr=result['spearman_corr'],
+                                  best_metric_pair=result['best_metric_pair'])
+        # else: drop the edge entirely
+    
+    return causal_graph
+```
+
+Key additional points:
+
+1. Only test edges that exist in the dependency graph. Don't test cross-correlation between services that have no call relationship — it would be meaningless.
+
+2. Handle cycles: if A→B and B→A both have causal evidence (possible in microservices with retries), mark both edges but note the cycle. The anomaly onset times should break the tie: whichever service became anomalous first is more likely the root cause.
+
+3. Handle isolated nodes: if a service is anomalous but has no incoming causal edges, it's a candidate root cause. If it has no outgoing causal edges, it might be a leaf victim (or your detection missed the causal chain).
+
+4. **Why dropping edges is safe and correct:** The dependency graph says "frontend *can* call database." But during a specific incident, the frontend did not cause the database to fail — the database failed independently and the frontend suffered. The causal graph should NOT have an edge `frontend → database`. Dropping it is exactly what you want.
+
+5. **Confidence note:** The `edge_lag_windows` fallback to 10 minutes is a safety net. If your trace data doesn't cover a particular edge (e.g., it was rarely exercised during the baseline period), the default window may be too short for async edges. Monitor the test suite for edges that consistently fail correlation checks and manually adjust their lag windows.
+
+**How to verify it works:**
+- Inject a fault into `database`. The causal graph should show: database → (all services that call the database). No edges should go INTO the database (nothing caused its anomaly — it's the root cause). The graph becomes a star centered on the database.
+- Inject a fault into `cart-service`. The causal graph should show: cart-service → (services that call cart-service). The edge from `frontend → cart-service` should NOT appear in the causal graph (frontend didn't cause cart-service's problem — cart-service is the root cause, and frontend is just a victim).
+- For each high-confidence edge, verify that `best_metric_pair` matches the expected propagation mechanism (e.g., DB CPU → payment latency for a database CPU stress test).
+
+### Understanding Checkpoints for Phase 3
+
+1. "If the database fails first and payment-service fails 2 minutes later, but their metric shapes don't correlate (Pearson < 0.6 AND Spearman < 0.7), what should the causal graph do?" — Answer: Keep a **low-confidence** edge `database → payment-service`. Temporal precedence is satisfied, so the anomaly likely propagated through this dependency. But the weak correlation suggests the relationship is noisy, asynchronous, or mediated by a third factor. The reasoning path should show it but flag it as uncertain.
+
+2. "Can I explain why PELT changepoint detection is better than z-score thresholding for finding anomaly onsets?" — Answer: Z-scores compare individual points against a global baseline. PELT detects the moment the entire local distribution shifts. For gradual failures (memory leaks, connection pool exhaustion), the z-score may not cross 3σ for minutes or hours after the leak started. PELT detects the onset at the beginning of the shift because the mean of the post-onset segment is different from the pre-onset segment.
+
+3. "If service A becomes anomalous at 02:12 and service B becomes anomalous at 02:14, but cross-correlation A→B is weak (Pearson < 0.6, Spearman < 0.7), what are the possible explanations?" — Answer: (1) The data is too noisy for cross-correlation to detect the shape similarity. (2) A didn't actually cause B — they're both caused by an unobserved C. (3) The relationship is non-linear and non-monotonic (cross-correlation and Spearman both miss it — this is the gap where Transfer Entropy would help). (4) The propagation delay is longer than the per-edge lag window.
+
+4. "Does my causal graph correctly trace the propagation path for at least 3 different fault types?" — If no, debug the onset detection and cross-correlation thresholds.
+
+5. "Can I explain why all-pairs metric correlation is better than the dominant-metric heuristic?" — Answer: The propagation signal may live in a cross-metric relationship (e.g., DB CPU → payment latency) that the dominant-metric heuristic misses if each service's strongest anomaly is in a different metric. All-pairs tests every combination and reports which pair carried the signal.
+
+6. "Can I explain how per-edge lag windows are derived from trace data and why they're better than a fixed global window?" — Answer: Trace data gives the P99 span duration for each edge. Multiplying by a safety factor (10×) converts this to a reasonable lag window. Synchronous edges (fast RPCs) get ~1 minute windows; async edges (queue-based) get 15-30 minute windows. A fixed global window would either miss async edges (if too short) or produce false positives on sync edges (if too long).
+
+---
+
+## Phase 4: Reasoning Layer and Dashboard — Making It Explainable
+
+### Real Objective
+
+You are transforming your tool from a "black box that gives answers" into a "transparent investigation partner." An SRE doesn't just want to know "inventory-service is the root cause." They want to know WHY. What evidence supports this? How did the failure propagate? What metrics are abnormal? When did it start? A tool that provides evidence and reasoning is trusted. A tool that only provides answers is ignored.
+
+This phase implements two things: (1) a reasoning path generator that produces a human-readable explanation of the root cause, and (2) a web dashboard that displays this explanation interactively.
+
+### Tool Objective
+
+By the end of Phase 4, the tool must:
+1. Generate a propagation path: "inventory-service → database → payment-service → cart-service → frontend" with evidence at each step
+2. Compute a multi-factor confidence score (not just a single number, but a breakdown: "anomaly strength: 28/30, downstream impact: 20/25, temporal priority: 25/25, multi-signal agreement: 15/20 → total: 88/100")
+3. Display the root cause, propagation path, evidence, and confidence breakdown on a web dashboard
+4. Allow the user to click on any node in the propagation path to see its detailed evidence
+5. Export an incident report in markdown format
+
+### What You Must Understand Before Coding
+
+#### Concept 14: The Reasoning Path (Inspired by ThinkFL's Recursion-of-Thought)
+
+ThinkFL's Recursion-of-Thought (RoT) is an LLM-based approach where the model iteratively queries tools, refines hypotheses, and backtracks. You're not using an LLM, but you can implement a **deterministic version** of this concept.
+
+The reasoning path is a **breadth-first traversal** of the causal graph starting from the root cause. At each step, you record:
+- Which service you're looking at
+- What evidence makes it anomalous (metric z-scores, trace Ochiai score, anomaly onset time)
+- What evidence connects it to the next service in the path (causal edge confidence, time delay between onsets)
+
+**Why this is like ThinkFL's RoT:** ThinkFL's RoT also generates a sequence of reasoning steps, each building on the previous one, with evidence at each step. The difference is that ThinkFL uses an LLM to decide the next step, while you use the causal graph to determine the next step. The causal graph IS your reasoning strategy — it tells you exactly which services to investigate and in what order.
+
+**Self-check:** Given a causal graph with edges A→B, B→C, B→D, and A is the root cause, can you write out the reasoning path? Answer: A (root cause, evidence: ...) → B (downstream of A, delay: 2min, evidence: ...) → C (downstream of B, delay: 1min, evidence: ...) AND D (downstream of B, delay: 1.5min, evidence: ...). Note that B branches to both C and D — the path is a tree, not a single chain.
+
+#### Concept 15: Multi-Factor Confidence Scoring (From ThinkFL's Grader)
+
+ThinkFL's Multi-Factor Grader evaluates a root cause hypothesis from multiple dimensions. You'll implement a simplified version with four factors:
+
+**Factor 1: Anomaly Strength (0–30 points)**
+How far from normal is this service? Measured by the maximum z-score across all metrics and the Ochiai score. A service with z-scores > 5 across multiple metrics and Ochiai > 0.8 gets full points.
+
+**Factor 2: Downstream Impact (0–25 points)**
+How many other services are affected because of this one? Count the number of services reachable from this service in the causal graph. A service with 5+ downstream victims gets full points.
+
+**Factor 3: Temporal Priority (0–25 points)**
+Is this service the earliest anomalous service? If it's the very first → 25 points. If it's within the first 3 → 15 points. If it's later → 5 points. The root cause should be among the earliest anomalous services.
+
+**Factor 4: Multi-Signal Agreement (0–20 points)**
+Do the trace signal and the metric signal agree? If both indicate this service is anomalous → 20 points. If only one signals anomaly → 10 points. If neither strongly signals → 0 points.
+
+**Why this breakdown matters:** It gives the SRE a reason to trust (or distrust) the result. "88% confidence" is meaningless. "88% confidence because: anomaly is very strong (28/30), it affects many services (20/25), it was the earliest anomaly (25/25), and traces and metrics both agree (15/20)" is actionable.
+
+**Self-check:** A service has max z-score of 2.1 (mild), Ochiai score of 0.6 (moderate), affects 3 downstream services, was the 2nd earliest anomaly, and only the trace signal flags it (metrics are normal). What would you score it? Answer: Anomaly strength ~15/30 (mild), downstream impact ~15/25 (moderate), temporal priority ~15/25 (not the earliest), multi-signal ~10/20 (only traces). Total ~55/100. This is a moderate-confidence result — the SRE should investigate but shouldn't blindly trust it.
+
+### What to Study and Where
+
+| What | Where | What to Extract |
+|---|---|---|
+| ThinkFL paper, Section 4.1.2 | [ThinkFL (2025)](https://arxiv.org/abs/2504.18776v1) | The Recursion-of-Thought concept. Understand how each reasoning step includes evidence and how the path is interpretable. Your deterministic version will follow the same structure but use the causal graph instead of an LLM to determine the next step. |
+| ThinkFL paper, Section 4.2 | Same | The Multi-Factor Grader. Understand the three dimensions it evaluates (result correctness, reasoning path validity, hallucination penalty). You'll implement a simplified version focused on the four factors described in Concept 15. |
+| Streamlit documentation | [Streamlit docs](https://docs.streamlit.io/) | The basics: `st.write`, `st.graphviz_chart`, `st.dataframe`, `st.metric`, `st.expander`. You'll build the dashboard using these primitives. |
+
+### What to Code
+
+#### Component 14: Reasoning Path Generator
+
+**Purpose:** Produce a human-readable propagation path with evidence at each step.
+
+**Input:** Root cause service, causal graph, temporal ordering, metric evidence, trace evidence
+**Output:** List of reasoning steps, each containing: service name, evidence list, next services, and connection details
+
+**What to understand when coding this:**
+
+1. Start from the root cause service (highest-ranked from PageRank).
+2. BFS through the causal graph.
+3. At each node, collect:
+   - All metric anomalies (which metrics, z-scores, baseline vs. current values)
+   - Trace anomaly (Ochiai score, what fraction of anomalous traces contain this service)
+   - Anomaly onset time
+4. At each edge, record:
+   - Time delay between the source and target anomaly onsets
+   - Causal confidence (high or low, from the causal graph builder)
+5. Format each step as a structured record.
+
+**How to verify it works:**
+- Inject a database failure. The reasoning path should start at the database and branch out to all affected services.
+- The path should show: "database became anomalous at 02:12:17 → payment-service became anomalous at 02:14:03 (delay: 1m46s) → cart-service became anomalous at 02:15:12 (delay: 1m9s) → frontend became anomalous at 02:16:01 (delay: 49s)."
+- The time delays should be decreasing as you go further from the root cause (because the propagation effect becomes more immediate for downstream services).
+
+#### Component 15: Multi-Factor Confidence Scorer
+
+**Purpose:** Compute a confidence breakdown for the root cause prediction.
+
+**Input:** Root cause service, all anomaly data, causal graph
+**Output:** Confidence score (0–100) with per-factor breakdown
+
+**Implementation:** See Concept 15 above for the scoring logic. Code it as four separate functions (one per factor) that each return a score, then sum them.
+
+#### Component 16: Web Dashboard (Streamlit)
+
+**Purpose:** Display the root cause, propagation path, evidence, and confidence breakdown in an interactive web UI.
+
+**Key design decisions:**
+
+1. **Use `streamlit-agraph` or `graphviz` for the propagation path visualization.** You want an interactive graph where clicking a node shows its details.
+
+2. **Layout:**
+   - Top: Incident summary (time, root cause service, confidence)
+   - Middle: Interactive causal graph with propagation path highlighted
+   - Bottom: Click a node → see its evidence panel (metric charts, trace stats, onset time)
+
+3. **Metric charts:** Use `st.line_chart()` with Plotly to show the baseline vs. incident metric values. The anomaly region should be visually distinct (red background or highlighted area).
+
+4. **Postmortem export:** Generate a markdown file with all the information from the dashboard. Include: incident time, root cause, propagation path, evidence per service, confidence breakdown.
+
+**How to verify it works:**
+- Inject a fault, run the pipeline, open the dashboard
+- The root cause should be clearly displayed
+- Clicking on the root cause should show its evidence
+- Clicking on a downstream service should show how it was affected
+- The propagation path should be visually traceable from root cause to all victims
+- The postmortem export should contain all the same information as the dashboard
+
+### Understanding Checkpoints for Phase 4
+
+1. "Can I explain why a multi-factor confidence score is better than a single number?" — If no, re-read Concept 15.
+2. "Can I trace through the reasoning path for a specific fault scenario and explain what evidence would appear at each step?" — If no, you don't understand how the causal graph translates into a human-readable explanation.
+3. "Would an SRE at 3 AM be able to look at my dashboard and immediately know what to do?" — If the answer isn't an immediate yes, simplify the dashboard. Remove anything that doesn't directly answer "what's broken and what do I do about it?"
+
+---
+
+## Phase 5: Evaluation and Polish — Proving It Works
+
+### Real Objective
+
+You are transitioning from "it works on my machine" to "I can prove it works." This matters for your portfolio (employers want evidence, not claims), for your own confidence (you should know exactly where your tool is strong and where it's weak), and for the field (publishing results helps others build on your work).
+
+### Tool Objective
+
+By the end of Phase 5, you must have:
+1. Quantitative accuracy metrics across ≥5 fault scenarios
+2. A comparison showing your tool outperforms Phase 1 (trace-only) baseline
+3. A polished, one-command-setup GitHub repository
+4. A demo video or GIF showing the tool in action
+
+### What You Must Understand Before Coding
+
+#### Concept 16: Evaluation Metrics for Root Cause Analysis
+
+The standard metrics for RCA evaluation are:
+
+**Top-k Accuracy**: Is the actual root cause in the top-k ranked services?
+- Top-1: Is it ranked #1? (Most important metric — SREs look at the first result first)
+- Top-3: Is it in the top 3? (Practical metric — SREs will check the top 3)
+- Top-5: Is it in the top 5? (Forgiving metric — useful for complex incidents with multiple root causes)
+
+**Average Rank**: What is the average rank of the actual root cause across all test scenarios? Lower is better. An average rank of 1.0 means perfect top-1 accuracy.
+
+**Mean Reciprocal Rank (MRR)**: $\text{MRR} = \frac{1}{|Q|} \sum_{i=1}^{|Q|} \frac{1}{\text{rank}_i}$ where $\text{rank}_i$ is the rank of the actual root cause in the $i$-th test scenario. MRR = 1.0 means perfect. MRR = 0.5 means the root cause is typically ranked #2.
+
+**Why Top-1 matters most:** In an active incident, the SRE wants ONE answer. If your tool says "it might be A, B, or C," the SRE has to investigate all three — which is only marginally better than no tool at all. Top-1 accuracy is the metric that determines whether your tool saves time or adds noise.
+
+**Self-check:** Your tool ranks the root cause as #1 in 3 out of 5 scenarios, #2 in 1 scenario, and #4 in 1 scenario. What are the Top-1, Top-3, and MRR scores? Answer: Top-1 = 3/5 = 60%, Top-3 = 4/5 = 80%, MRR = (1/1 + 1/1 + 1/1 + 1/2 + 1/4) / 5 = (1 + 1 + 1 + 0.5 + 0.25) / 5 = 3.75/5 = 0.75.
+
+### What to Code
+
+#### Component 17: Evaluation Framework
+
+**Purpose:** Run the full pipeline on all fault scenarios, collect metrics, and produce a comparison report.
+
+**Input:** List of fault scenarios, pipeline configuration
+**Output:** Evaluation report with Top-1, Top-3, MRR, per-scenario breakdown, and comparison against baseline (Phase 1 trace-only)
+
+**What to understand when coding this:**
+
+1. For each fault scenario:
+   a. Inject the fault
+   b. Wait for propagation
+   c. Run the pipeline
+   d. Record the ranked output
+   e. Compare against the expected root cause
+   f. Clean up
+
+2. Compute aggregate metrics across all scenarios.
+
+3. Run the SAME scenarios with Phase 1's pipeline (trace-only, no metrics, no causal graph) as a baseline comparison.
+
+4. The Phase 2+ pipeline should clearly outperform the Phase 1 pipeline on metric-heavy faults (CPU stress, memory leak) and should perform at least as well on trace-heavy faults (latency injection, error spikes).
+
+5. Generate a comparison table:
+```
+| Scenario          | Phase 1 Rank | Phase 3 Rank | Phase 1 Top-3 | Phase 3 Top-3 |
+|---|---|---|---|---|
+| CPU stress        | 5            | 1            | No             | Yes            |
+| Network latency   | 1            | 1            | Yes            | Yes            |
+| Pod crash         | 3            | 1            | Yes            | Yes            |
+| DB contention     | 4            | 1            | No             | Yes            |
+| Error injection   | 2            | 1            | Yes            | Yes            |
+```
+
+#### Component 18: Polish and Packaging
+
+**Purpose:** Make the project presentable and easy for others to run.
+
+**Checklist:**
+- [ ] `docker-compose.yml` that starts the entire stack (K8s, Online Boutique, Jaeger, Prometheus, your tool) with one command
+- [ ] `README.md` with: problem statement, architecture diagram, setup instructions, usage instructions, evaluation results
+- [ ] Demo script that injects a fault, runs the pipeline, and opens the dashboard — all automated
+- [ ] Screen recording or GIF of the demo
+- [ ] Clean code: remove debug prints, add docstrings, organize into modules
+
+### Understanding Checkpoints for Phase 5
+
+1. "Can I demonstrate that my Phase 3 tool outperforms Phase 1 on at least 3 out of 5 fault scenarios?" — If no, go back and fix the failing scenarios.
+2. "Can a new user set up and run my tool in under 30 minutes?" — If no, simplify the setup.
+3. "Can I explain my tool's architecture to a stranger in 2 minutes?" — If no, refine your README and demo.
+
+---
+
+## Cross-Phase Reference: Where Concepts Are Used
+
+| Concept | Phase Introduced | Used Again In | Why It Recurs |
+|---|---|---|---|
+| Span tree / trace structure | Phase 0 | Phase 1 (graph building, anomaly classification), Phase 3 (onset detection) | Traces are the primary data source throughout |
+| Ochiai scoring | Phase 1 | Phase 2 (as a component of fused score), Phase 4 (as evidence) | The trace anomaly signal persists even after adding metrics |
+| Personalized PageRank | Phase 1 | Phase 2 (with fused personalization), Phase 4 (for confidence breakdown) | The ranking algorithm evolves but the core stays the same |
+| Z-score anomaly detection | Phase 2 | Phase 3 (onset detection), Phase 4 (evidence display) | Metric anomaly detection is used everywhere metrics appear |
+| Causal graph | Phase 3 | Phase 4 (reasoning path, dashboard), Phase 5 (evaluation) | The causal graph is the foundation of the explanation layer |
+| Temporal ordering | Phase 3 | Phase 4 (propagation path delays), Phase 5 (confidence scoring) | Time is the strongest signal for causation |
+| Cross-correlation lag | Phase 3 | Phase 4 (evidence display: "DB CPU predicted payment latency at lag=2min") | The metric-pair evidence enriches the reasoning path |
+| Per-edge lag windows | Phase 3 | Phase 4 (confidence breakdown: "long propagation delay flags async dependency") | Async vs. sync distinction is valuable context for SREs |
+
+---
+
+## Cross-Phase Reference: Data Structures
+
+These are the core data structures that flow between components. Define them once, use them everywhere.
+
+```python
+@dataclass
+class Span:
+    trace_id: str
+    span_id: str
+    parent_id: Optional[str]      # None if root span
+    service_name: str
+    operation_name: str
+    start_time: datetime
+    duration_ms: float
+    status: str                    # "ok" or "error"
+    tags: Dict[str, str]           # additional metadata
+
+@dataclass
+class Trace:
+    trace_id: str
+    spans: List[Span]
+    root_service: str
+    total_duration_ms: float
+    is_anomalous: Optional[bool] = None   # set by AnomalyClassifier
+
+@dataclass
+class MetricAnomaly:
+    service_name: str
+    metric_name: str
+    z_score: float
+    baseline_mean: float
+    baseline_std: float
+    current_value: float
+    onset_time: Optional[datetime] = None
+
+@dataclass
+class CausalEdge:
+    source: str
+    target: str
+    confidence: str                # "high" or "low"
+    lag_minutes: Optional[float]
+    pearson_corr: float
+    spearman_corr: float
+    best_metric_pair: Optional[Tuple[str, str]]  # e.g., ("cpu", "latency")
+
+@dataclass
+class ReasoningStep:
+    service_name: str
+    metric_anomalies: List[MetricAnomaly]
+    trace_anomaly_score: float
+    anomaly_onset: Optional[datetime]
+    downstream_services: List[str]
+    evidence_summary: str           # human-readable
+
+@dataclass
+class RootCauseResult:
+    root_cause_service: str
+    confidence_score: float         # 0-100
+    confidence_breakdown: Dict[str, float]  # factor_name → score
+    propagation_path: List[ReasoningStep]
+    causal_graph: nx.DiGraph        # edges have CausalEdge data as attributes
+    ranked_services: List[Tuple[str, float]]
+```
+
+---
+
+## Emergency Reference: If You Get Stuck
+
+| Symptom | Likely Cause | Fix |
+|---|---|---|
+| All Ochiai scores are near 0 | Not enough anomalous traces, or anomaly threshold too high | Lower the trace anomaly threshold (try 1.5× P95 instead of 2×) |
+| Frontend is always ranked #1 | PageRank personalization not working | Check that personalization vector is normalized and correctly passed |
+| Metric z-scores are all 0 | Wrong PromQL query or wrong time window | Manually verify the query in the Prometheus UI |
+| Causal graph is too dense (every edge is causal) | Cross-correlation threshold too lenient | Increase the Pearson threshold from 0.6 to 0.7, or Spearman from 0.7 to 0.8 |
+| Causal graph is too sparse (no edges) | Onset detection off or per-edge lag window too short | Verify PELT pen parameter; check edge_lag_windows for async edges; try adaptive expansion |
+| Cross-correlation misses an obvious causal edge | Non-linear, non-monotonic relationship (both Pearson and Spearman fail) | This is the gap where Transfer Entropy would help — add it as a Phase 3b upgrade for the specific edge type |
+| best_metric_pair is unexpected (e.g., memory → error_rate) | The propagation mechanism is different than assumed | This is actually valuable evidence — the metric pair reveals *how* the failure propagated. Trust the data. |
+| Onset times are all the same | Time granularity too coarse | Use 30-second or 1-minute Prometheus step size |
+| CPU stress fault not detected | CPU stress doesn't cause enough latency for trace anomaly | This is expected — it's why you added metrics (Phase 2) |
+| Database failure → all services ranked equally | PageRank needs the fused personalization, not Ochiai alone | Ensure Phase 2's fused scores are used as the personalization vector |
+
+This document is your reference. When you sit down to work on any phase, re-read that phase's section first. When prompting an LLM for implementation help, point it to the specific component and concept. When you're stuck, check the Emergency Reference table. Good luck.

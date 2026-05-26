@@ -1,0 +1,39 @@
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: yelb-appserver-probe
+  namespace: default
+  labels:
+    release: prometheus
+spec:
+  interval: 10s
+  module: http_2xx
+  prober:
+    url: blackbox-exporter.default.svc.cluster.local:9115
+    scheme: http
+    path: /probe
+  targets:
+    staticConfig:
+      static:
+      - http://yelb-appserver:4567/api/getvotes
+      - http://yelb-ui:80/
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Probe
+metadata:
+  name: yelb-db-probe
+  namespace: default
+  labels:
+    release: prometheus
+spec:
+  interval: 10s
+  module: tcp_connect
+  prober:
+    url: blackbox-exporter.default.svc.cluster.local:9115
+    scheme: http
+    path: /probe
+  targets:
+    staticConfig:
+      static:
+      - yelb-db:5432
+      - redis-server:6379

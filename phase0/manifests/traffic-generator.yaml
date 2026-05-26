@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: traffic-gen
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: traffic-gen
+  template:
+    metadata:
+      labels:
+        app: traffic-gen
+    spec:
+      containers:
+      - name: traffic-gen
+        image: curlimages/curl:latest
+        imagePullPolicy: IfNotPresent
+        command:
+        - sh
+        - -c
+        - |
+          echo "Starting continuous traffic generation..."
+          while true; do
+            curl -s http://yelb-appserver:4567/api/getvotes > /dev/null 2>&1
+            sleep $((RANDOM % 3 + 1))
+            curl -s http://yelb-ui:80/ > /dev/null 2>&1
+            sleep $((RANDOM % 2 + 1))
+          done
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 50m
+            memory: 64Mi

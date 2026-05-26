@@ -1,0 +1,18 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: otel-collector
+  namespace: observability
+  labels:
+    app: otel-collector
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: otel-collector
+  endpoints:
+  - port: metrics
+    path: /metrics
+    interval: 15s
+  namespaceSelector:
+    any: true

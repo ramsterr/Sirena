@@ -1,0 +1,208 @@
+# Project 5: Root Cause Ranker — Build Reference
+
+> This document is the canonical reference for building a graph-based root cause ranking library. It is a standalone, shippable project that contributes to Phase 1 and Phase 2 of the SRE Root Cause Analysis Tool. Use this as the source of truth when prompting for implementation help.
+
+---
+
+## Meta-Structure: How to Read This Document
+
+This project contains these sections:
+
+- **Real Objective** — What you are *actually* trying to accomplish, stated in plain English.
+- **Tool Objective** — What the software must do at the end. This is the acceptance test.
+- **What You Must Understand Before Coding** — Concepts, their internals, and why they matter.
+- **What to Study and Where** — Specific resources, specific sections, specific things to extract.
+- **What to Code** — Each component, its purpose, inputs, outputs, internals, and verification.
+- **How the Pieces Connect** — Data flow showing how components connect.
+- **Understanding Checkpoints** — Concrete things you should be able to explain before moving on.
+- **Common Mistakes** — What people get wrong and how to avoid it.
+- **Ship Criteria** — What makes this project ready to publish and share.
+
+---
+
+## Real Objective
+
+You are building a library that takes a dependency graph and anomaly scores, then ranks services by their likelihood of being the root cause using Personalized PageRank. Think of it like a judge weighing evidence — the anomaly scores are the initial suspicion, and the graph structure is the context that helps determine whether a suspicious service is the actual perpetrator or just an accomplice. This library works on any graph where nodes have initial suspicion scores and you want to find the most likely source of the problem.
+
+## Tool Objective
+
+By the end of this project, the library must:
+1. Accept a directed, weighted graph and a dictionary of anomaly scores per node
+2. Run Personalized PageRank with the anomaly scores as the personalization vector
+3. Return a ranked list of nodes by root cause likelihood
+4. Support multiple ranking algorithms (Personalized PageRank, standard PageRank, betweenness centrality)
+5. Be installable via pip with a clean API
+6. Include tests with known graph structures and expected rankings
+
+## What You Must Understand Before Coding
+
+### Concept 1: Personalized PageRank
+
+Standard PageRank simulates a random surfer who follows links with probability α (typically 0.85) and teleports to a random node with probability 1-α. Personalized PageRank changes the teleportation: instead of teleporting uniformly, the surfer teleports according to a personalization vector that favors certain nodes.
+
+In your case, the personalization vector is the normalized anomaly scores. Services with high anomaly scores are preferred teleport destinations. This means the random surfer spends more time near suspicious services, and the final scores reflect both graph centrality AND suspiciousness.
+
+**Why both anomaly scores AND PageRank?** Because anomaly scores alone can be misleading. A downstream service might have a high anomaly score because the root cause's failure propagates to it. PageRank captures the graph structure: if service A feeds anomaly to service B, A should rank higher.
+
+**Mathematical formulation:**
+`r = α * M * r + (1 - α) * p`
+
+Where M is the column-normalized adjacency matrix, p is the personalization vector (normalized anomaly scores), and α is the damping factor (0.85).
+
+**Self-check:** Why would standard PageRank (uniform personalization) rank the frontend as #1 in a microservice graph? Answer: The frontend has the highest out-degree (calls many services), so a random surfer following links will spend the most time there. Personalization fixes this by biasing teleportation toward suspicious services.
+
+## What to Study and Where
+
+| What | Where | What to Extract |
+|---|---|---|
+| NetworkX PageRank | [NetworkX PageRank docs](https://networkx.org/documentation/stable/reference/algorithms/generated/networkx.algorithms.link_analysis.pagerank_alg.pagerank.html) | The `personalization` parameter: expects a dict mapping node → float, summing to 1. |
+| PageRank algorithm | [Wikipedia: PageRank](https://en.wikipedia.org/wiki/PageRank) | The mathematical formulation, damping factor, and convergence criteria. |
+| Betweenness centrality | [NetworkX betweenness](https://networkx.org/documentation/stable/reference/algorithms/generated/networkx.algorithms.centrality.betweenness_centrality.html) | Alternative ranking algorithm. Measures how often a node lies on shortest paths between other nodes. |
+
+## What to Code
+
+### Component 5.1: Personalized PageRank Ranker
+
+**Purpose:** Run Personalized PageRank with anomaly scores as personalization.
+
+**Input:** NetworkX DiGraph, anomaly scores dict
+**Output:** Ranked list of (node, score) tuples
+
+**What to understand when coding this:**
+
+```python
+import networkx as nx
+
+class RootCauseRanker:
+    def rank_pagerank(self, graph: nx.DiGraph,
+                      anomaly_scores: Dict[str, float],
+                      alpha: float = 0.85) -> List[Tuple[str, float]]:
+        # Normalize anomaly scores to sum to 1
+        total = sum(anomaly_scores.values())
+        if total == 0:
+            # No anomaly signal — fall back to uniform
+            personalization = None
+        else:
+            personalization = {
+                node: anomaly_scores.get(node, 0) / total
+                for node in graph.nodes()
+            }
+
+        ranked = nx.pagerank(
+            graph,
+            alpha=alpha,
+            personalization=personalization,
+            weight='weight',
+            max_iter=100,
+            tol=1e-06
+        )
+
+        return sorted(ranked.items(), key=lambda x: x[1], reverse=True)
+```
+
+**Key points:**
+- The personalization vector must include ALL nodes in the graph (use 0 for nodes with no anomaly score).
+- The personalization vector must sum to 1.
+- If all anomaly scores are 0, fall back to standard PageRank (uniform personalization).
+
+**How to verify it works:**
+- Create a simple graph: A → B → C. Give A a high anomaly score, B and C low scores. A should rank #1.
+- Create a graph where A and B have equal anomaly scores, but A is upstream of B. A should rank higher.
+- Compare with standard PageRank (no personalization). The most connected node should rank #1.
+
+### Component 5.2: Alternative Rankers
+
+**Purpose:** Provide additional ranking algorithms for comparison.
+
+**Algorithms:**
+1. **Standard PageRank:** No personalization. Ranks by graph centrality alone.
+2. **Betweenness centrality:** Ranks by how often a node lies on shortest paths.
+3. **Anomaly-only:** Ranks by anomaly score alone (no graph consideration).
+
+**What to understand when coding this:**
+
+```python
+def rank_betweenness(self, graph: nx.DiGraph) -> List[Tuple[str, float]]:
+    scores = nx.betweenness_centrality(graph, weight='weight')
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+def rank_anomaly_only(self, anomaly_scores: Dict[str, float]) -> List[Tuple[str, float]]:
+    return sorted(anomaly_scores.items(), key=lambda x: x[1], reverse=True)
+```
+
+**How to verify it works:**
+- Run all three rankers on the same graph + anomaly scores.
+- The results should differ: PageRank considers both structure and anomaly, betweenness considers only structure, anomaly-only considers only scores.
+
+### Component 5.3: CLI and Library API
+
+**Purpose:** Provide both a CLI and a Python library interface.
+
+**CLI commands:**
+```bash
+# Rank from graph and scores files
+root-cause-rank rank --graph graph.json --scores scores.json
+
+# Choose algorithm
+root-cause-rank rank --graph graph.json --scores scores.json --algorithm pagerank
+
+# Compare all algorithms
+root-cause-rank compare --graph graph.json --scores scores.json
+```
+
+**Library API:**
+```python
+from root_cause_ranker import RootCauseRanker
+
+ranker = RootCauseRanker()
+ranked = ranker.rank_pagerank(graph, anomaly_scores, alpha=0.85)
+```
+
+## How the Pieces Connect
+
+```
+Graph (DiGraph) + Anomaly Scores
+              │
+              ▼
+┌─────────────────┐
+│ Normalize Scores │ ←─── Creates personalization vector
+└────────┬────────┘
+         │
+    ┌────┴────┐
+    ▼         ▼         ▼
+┌────────┐ ┌──────────┐ ┌──────────────┐
+│ PageRank│ │Betweenness│ │Anomaly-Only  │
+│ (with   │ │(structure)│ │(scores only) │
+│ personal)│ │          │ │              │
+└────┬───┘ └────┬─────┘ └──────┬───────┘
+     │          │               │
+     └──────────┴───────────────┘
+                │
+                ▼
+┌─────────────────┐
+│ Ranked Output    │ ←─── Sorted list of (node, score)
+└─────────────────┘
+```
+
+## Understanding Checkpoints
+
+1. "Can I explain why the personalization vector must sum to 1?" — If no, re-read the PageRank formulation in Concept 1.
+2. "Can I predict the ranking for a simple 3-node graph with given anomaly scores?" — If no, trace through the PageRank iteration by hand.
+3. "Do the three ranking algorithms produce different results on a test graph?" — If no, your graph or anomaly scores might not have enough variation.
+
+## Common Mistakes
+
+1. **Not including all nodes in the personalization vector.** NetworkX requires every node to have an entry. Missing nodes cause silent errors.
+2. **Not normalizing the personalization vector.** If scores sum to 4.7 instead of 1.0, PageRank produces wrong results.
+3. **Using the wrong edge direction.** PageRank follows edges in their direction. If your graph has edges pointing the wrong way (callee → caller instead of caller → callee), the ranking will be inverted.
+
+## Ship Criteria
+
+- [ ] Implements Personalized PageRank, standard PageRank, betweenness, and anomaly-only ranking
+- [ ] Clean Python library API
+- [ ] CLI with `rank` and `compare` commands
+- [ ] JSON input/output
+- [ ] Comprehensive test suite with known graphs and expected rankings
+- [ ] pip-installable
+- [ ] README with algorithm explanations and usage examples
+- [ ] Works on any directed graph with node scores

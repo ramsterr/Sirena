@@ -1,0 +1,18 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: yelb-appserver
+  namespace: default
+  labels:
+    app: yelb-appserver
+spec:
+  selector:
+    matchLabels:
+      app: yelb-appserver
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 15s
+  namespaceSelector:
+    matchNames:
+    - default

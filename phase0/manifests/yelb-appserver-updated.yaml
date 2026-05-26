@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: yelb-appserver
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: yelb-appserver
+      tier: middletier
+  template:
+    metadata:
+      labels:
+        app: yelb-appserver
+        tier: middletier
+    spec:
+      containers:
+      - name: yelb-appserver
+        image: yelb-appserver-otel:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 4567
+          name: http
+        env:
+        - name: OTEL_SERVICE_NAME
+          value: yelb-appserver
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: http://jaeger-collector.observability:4318
+        - name: OTEL_TRACES_SAMPLER
+          value: always_on
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi

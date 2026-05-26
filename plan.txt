@@ -1,0 +1,927 @@
+# The SRE Root Cause Analysis Tool — Full Build Plan
+
+This plan assumes ~15–20 hours/week of focused work. Total duration: ~10–12 weeks.
+
+---
+
+## Phase 0: Foundation (Week 1)
+
+**Goal:** Set up your lab environment and learn enough about the domain to not get lost in Phase 1.
+
+### What to Learn
+
+- **Distributed Tracing Fundamentals**: Understand spans, traces, traceIDs, spanIDs, parent-child relationships. Read the [OpenTelemetry specification](https://opentelemetry.io/docs/concepts/) for 2 hours. This is the *language* your tool will speak.
+- **Time Series Basics**: Prometheus data model (counters, gauges, histograms), PromQL basics. You need to be able to query "what was the latency of service X at time T?"
+- **Graph Algorithms (light)**: Understand PageRank intuition (a node is important if important nodes point to it). You don't need the math yet — just the mental model.
+- **Microservice Anatomy**: Spin up the [Online Boutique](https://github.com/GoogleCloudPlatform/microservices-demo) (Google's demo app, 11 services). Deploy it. Break it. Watch what happens in Grafana.
+
+### What to Build
+
+```
+Week 1 Deliverable: Running observability stack + demo app
+─────────────────────────────────────────────────────────
+✅ Kubernetes cluster (minikube or kind)
+✅ Online Boutique deployed
+✅ Jaeger collecting traces
+✅ Prometheus collecting metrics  
+✅ Grafana with dashboards
+✅ Load generator sending traffic
+```
+
+### How to Validate
+
+Open Jaeger. Find a trace. You should see something like:
+```
+frontend → cartService → paymentService → database
+```
+Each span has a duration. If you can see this, your tracing works.
+
+Open Grafana. Find the "cartService latency" metric. You should see a time series. If you can see this, your metrics work.
+
+### Key Pitfall
+Don't try to build your own tracing or metrics collection. OpenTelemetry + Jaeger + Prometheus already do this perfectly. Your tool *consumes* this data, it doesn't collect it.
+
+---
+
+## Phase 1: MicroRank Core (Weeks 2–4)
+
+**Goal:** Build the v1 that takes traces, builds a dependency graph, scores anomalies, and ranks root causes. This is the working prototype.
+
+### What to Extract from the MicroRank Paper
+
+Read the paper with these specific questions in mind:
+
+| Paper Section | What You Need From It | How You'll Use It |
+|---|---|---|
+| Trace Coverage Tree (Section 3.1) | How to convert raw traces into a service dependency graph | This becomes your `build_dependency_graph()` function |
+| Spectrum Analysis (Section 3.2) | The Ochiai scoring formula: `score = failed_traces_containing_service / sqrt(total_failed * total_containing_service)` | This becomes your `spectrum_score()` function |
+| Personalized PageRank (Section 3.3) | How to combine spectrum scores with graph structure | This becomes your `rank_root_causes()` function |
+| Anomaly Detection (Section 3.1) | How to classify a trace as "anomalous" vs "normal" using latency percentiles | This becomes your `is_trace_anomalous()` function |
+
+### Architecture for Phase 1
+
+```
+┌──────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│   Jaeger API  │────▶│  Trace Collector  │────▶│  Dependency Graph │
+│  (raw traces) │     │  (parse & filter) │     │  (service nodes,  │
+└──────────────┘     └──────────────────┘     │   call edges)     │
+                                                └────────┬─────────┘
+                                                         │
+┌──────────────┐     ┌──────────────────┐               │
+│ Prometheus   │────▶│ Anomaly Detector  │───────────────┤
+│  (metrics)   │     │ (latency, errors) │               │
+└──────────────┘     └──────────────────┘               │
+                                                         ▼
+                                                ┌──────────────────┐
+                                                │ Spectrum Scorer   │
+                                                │ (Ochiai formula)  │
+                                                └────────┬─────────┘
+                                                         │
+                                                         ▼
+                                                ┌──────────────────┐
+                                                │ PageRank Ranker   │
+                                                │ (final ranking)   │
+                                                └────────┬─────────┘
+                                                         │
+                                                         ▼
+                                                ┌──────────────────┐
+                                                │  Output: Ranked   │
+                                                │  root cause list  │
+                                                └──────────────────┘
+```
+
+### Week-by-Week Breakdown
+
+#### Week 2: Data Ingestion + Dependency Graph
+
+**Build:**
+
+```python
+# 1. Trace Fetcher — pulls traces from Jaeger API
+class TraceFetcher:
+    def fetch_recent_traces(self, service_name, time_window_minutes=30):
+        # Call Jaeger API: GET /api/traces?service={service}&lookback={window}
+        # Return list of Trace objects
+        pass
+
+# 2. Trace Parser — converts raw trace data into structured format
+@dataclass
+class Span:
+    trace_id: str
+    span_id: str
+    parent_id: str       # None if root
+    service_name: str
+    operation: str
+    start_time: datetime
+    duration_ms: float
+    status: str           # "ok" or "error"
+
+@dataclass  
+class Trace:
+    trace_id: str
+    spans: List[Span]
+    root_service: str
+    total_duration_ms: float
+
+# 3. Dependency Graph Builder — from MicroRank's Trace Coverage Tree
+class DependencyGraph:
+    def build_from_traces(self, traces: List[Trace]) -> nx.DiGraph:
+        """
+        For each trace, extract the call tree:
+        - Each unique service = node
+        - Each observed call A→B = directed edge (with call count)
+        - Aggregate across all traces
+        Returns: NetworkX directed graph with weighted edges
+        """
+        pass
+```
+
+**Key thing to get right:** The dependency graph must be **per-service-instance**, not just per-service. In production, "payment-service-pod-3" can be broken while "payment-service-pod-1" is fine. If you only track at the service level, you'll miss this. Start with service-level for simplicity, but structure your code so you can add instance granularity later.
+
+**Test it:** Generate 1000 traces from your load generator. Build the graph. Print it. You should see ~11 nodes (for Online Boutique's 11 services) with edges matching the actual call patterns.
+
+#### Week 3: Anomaly Detection + Spectrum Scoring
+
+**Build:**
+
+```python
+# 1. Trace Anomaly Classifier
+class TraceAnomalyDetector:
+    def __init__(self, baseline_percentile=95):
+        self.baseline_percentile = baseline_percentile
+        self.baseline_latencies = {}  # per-service baseline
+    
+    def learn_baseline(self, normal_traces: List[Trace]):
+        """Learn normal latency distribution from healthy traces"""
+        for trace in normal_traces:
+            for span in trace.spans:
+                # Record P95 latency per service
+                pass
+    
+    def classify_trace(self, trace: Trace) -> str:
+        """
+        A trace is anomalous if ANY span exceeds its baseline P95 by 2x.
+        Returns: "anomalous" or "normal"
+        
+        From MicroRank: they use latency percentiles.
+        Simple v1: if span.duration > 2 * baseline_p95 → anomalous
+        """
+        pass
+
+# 2. Spectrum-Based Scorer — THE core of MicroRank
+class SpectrumScorer:
+    def ochiai_score(self, service: str, 
+                     anomalous_traces: List[Trace],
+                     normal_traces: List[Trace]) -> float:
+        """
+        Ochiai coefficient:
+        score = n_ef / sqrt(n_f * n_e)
+        
+        Where:
+        - n_ef = number of anomalous traces containing this service
+        - n_f  = total number of anomalous traces
+        - n_e  = total number of traces (anomalous + normal) containing this service
+        
+        High score = this service appears in many anomalous traces
+                    AND few normal traces → likely root cause
+        """
+        n_ef = sum(1 for t in anomalous_traces if service_in_trace(service, t))
+        n_f = len(anomalous_traces)
+        n_e = sum(1 for t in (anomalous_traces + normal_traces) 
+                  if service_in_trace(service, t))
+        
+        if n_ef == 0 or n_e == 0:
+            return 0.0
+        return n_ef / math.sqrt(n_f * n_e)
+```
+
+**Key thing to get right:** The time window matters enormously. You're comparing "traces from the last 30 minutes of anomaly" against "traces from the 30 minutes before the anomaly." If you compare against traces from 3 days ago, a deployment might have changed the baseline. Always use a sliding window relative to the incident.
+
+**Test it:** Inject a fault (e.g., add artificial latency to the `cartService`). Run your anomaly detector. It should classify traces that hit `cartService` as anomalous. Run your spectrum scorer. `cartService` should have the highest Ochiai score.
+
+#### Week 4: PageRank + Integration
+
+**Build:**
+
+```python
+# 1. Personalized PageRank — MicroRank's final ranking step
+class RootCauseRanker:
+    def rank(self, dependency_graph: nx.DiGraph, 
+             spectrum_scores: Dict[str, float]) -> List[Tuple[str, float]]:
+        """
+        1. Create a weighted adjacency matrix from the dependency graph
+        2. Set personalization vector = normalized spectrum scores
+           (services with high spectrum scores get higher "starting importance")
+        3. Run PageRank with this personalization
+        4. Return ranked list of (service, score) tuples
+        """
+        # Personalization vector: PageRank will favor nodes that already
+        # look suspicious (high spectrum score), but also considers
+        # graph structure — a suspicious node with many dependents
+        # is more likely the root cause than an isolated suspicious node
+        
+        personalization = {}
+        total = sum(spectrum_scores.values())
+        for node in dependency_graph.nodes():
+            personalization[node] = spectrum_scores.get(node, 0) / total
+        
+        ranked = nx.pagerank(dependency_graph, 
+                            personalization=personalization,
+                            alpha=0.85)  # standard damping factor
+        
+        return sorted(ranked.items(), key=lambda x: x[1], reverse=True)
+
+# 2. Pipeline Orchestrator — ties everything together
+class MicroRankPipeline:
+    def run(self, incident_time: datetime, 
+            window_minutes: int = 30) -> List[Tuple[str, float]]:
+        # Step 1: Fetch traces
+        traces = self.fetcher.fetch_recent_traces(incident_time, window_minutes)
+        
+        # Step 2: Build dependency graph
+        graph = self.graph_builder.build_from_traces(traces)
+        
+        # Step 3: Classify traces
+        anomalous, normal = self.detector.split_anomalous_normal(traces)
+        
+        # Step 4: Spectrum scoring
+        scores = {}
+        for service in graph.nodes():
+            scores[service] = self.scorer.ochiai_score(service, anomalous, normal)
+        
+        # Step 5: PageRank ranking
+        ranked = self.ranker.rank(graph, scores)
+        
+        return ranked
+```
+
+**Key thing to get right:** The `personalization` vector is what makes this "Personalized PageRank" instead of regular PageRank. Without it, PageRank just finds the most *central* node, which is often the frontend (because everything calls it). The personalization forces PageRank to consider both centrality AND suspiciousness.
+
+**Test it end-to-end:**
+1. Run your load generator for 30 minutes (baseline)
+2. Inject a fault: `kubectl exec cart-service -- tc qdisc add dev eth0 root netem delay 500ms`
+3. Wait 5 minutes
+4. Run your pipeline
+5. **Expected result:** `cartService` should be ranked #1
+6. Remove the fault: `kubectl exec cart-service -- tc qdisc del dev eth0 root`
+7. Run your pipeline again on normal data
+8. **Expected result:** No clear #1, all scores should be low and similar
+
+### Phase 1 Output
+
+At the end of Week 4, you should have:
+- A CLI tool: `python microrank.py --incident-time "2026-05-18 02:14" --window 30`
+- Output: A ranked list of services with scores
+- It correctly identifies which service you artificially broke
+
+---
+
+## Phase 2: Multi-Modal Fusion (Weeks 5–7)
+
+**Goal:** Add metrics as a second signal. Move from "this service appears in bad traces" to "this service has anomalous metrics AND appears in bad traces." This is where you implement the core idea from CHASE.
+
+### What to Extract from the CHASE Paper
+
+| Paper Section | What You Need From It | How You'll Use It |
+|---|---|---|
+| Multimodal Invocation Graph (Section III-B) | How to attach metric nodes to service nodes in the graph | Each service node gets connected to its metric nodes (CPU, memory, latency, error rate) |
+| Heterogeneous Message Passing (Section III-C) | How information flows between metric nodes and service nodes | Metric anomaly scores "flow up" to service nodes, enriching their anomaly signal |
+| Hypergraph Causal Learning (Section III-D) | How to learn causal edges, not just dependency edges | Instead of "A calls B," you learn "A's anomaly caused B's anomaly" |
+
+### Architecture for Phase 2
+
+```
+                    ┌─────────────────────────────┐
+                    │    Heterogeneous Graph        │
+                    │                               │
+                    │  [metric]  [service]  [metric]│
+                    │     \        |        /       │
+                    │      \       |       /        │
+                    │     [service]───[service]      │
+                    │      /       |       \        │
+                    │     /        |        \       │
+                    │  [metric]  [metric]  [metric] │
+                    └──────────────┬────────────────┘
+                                   │
+                    ┌──────────────▼────────────────┐
+                    │   Heterogeneous Message Passing │
+                    │                                 │
+                    │   Metric anomalies propagate UP │
+                    │   to service nodes               │
+                    │                                 │
+                    │   Service anomalies propagate   │
+                    │   ALONG causal edges             │
+                    └──────────────┬────────────────┘
+                                   │
+                    ┌──────────────▼────────────────┐
+                    │   Fused Anomaly Score           │
+                    │                                 │
+                    │   score = α·trace_score         │
+                    │         + β·metric_score        │
+                    │         + γ·graph_position      │
+                    └────────────────────────────────┘
+```
+
+### Week-by-Week Breakdown
+
+#### Week 5: Metric Anomaly Detection
+
+**Build:**
+
+```python
+class MetricAnomalyDetector:
+    """
+    Detect anomalies in Prometheus metrics per service.
+    v1: Simple statistical thresholds.
+    v2: Replace with 3-sigma or isolation forest.
+    """
+    
+    METRICS_PER_SERVICE = [
+        'container_cpu_usage_seconds_total',
+        'container_memory_working_set_bytes', 
+        'http_server_request_duration_seconds',  # latency
+        'http_server_requests_total{status="5xx"}',  # errors
+    ]
+    
+    def detect(self, service: str, 
+               incident_time: datetime) -> Dict[str, float]:
+        """
+        For each metric of this service:
+        1. Query Prometheus for baseline (1 hour before incident)
+        2. Query Prometheus for current window (incident ± 15 min)
+        3. Compare: is current value > 3σ from baseline?
+        
+        Returns: {metric_name: anomaly_score}
+        anomaly_score = (current - mean_baseline) / std_baseline
+        """
+        scores = {}
+        for metric in self.METRICS_PER_SERVICE:
+            baseline = self.query_prometheus(metric, service, 
+                                             before=incident_time)
+            current = self.query_prometheus(metric, service,
+                                            around=incident_time)
+            
+            mean_b = np.mean(baseline)
+            std_b = np.std(baseline)
+            
+            if std_b > 0:
+                scores[metric] = abs(np.mean(current) - mean_b) / std_b
+            else:
+                scores[metric] = 0.0
+        
+        return scores
+    
+    def query_prometheus(self, metric, service, **kwargs):
+        """Wrapper around PromQL queries"""
+        # e.g., rate(http_server_requests_total{service="cart", status="5xx"}[5m])
+        pass
+```
+
+**Key thing to get right:** Metric anomaly detection is noisy. CPU at 80% might be normal during peak traffic but anomalous at 3 AM. Always compare against *the same service at the same traffic level*, not a global threshold. Use rate() and delta() in PromQL to normalize for traffic volume.
+
+**Test it:** Inject a CPU spike: `kubectl exec inventory-service -- stress --cpu 4 --timeout 300s`. Your metric detector should flag `inventory-service`'s CPU metric as anomalous (z-score > 3).
+
+#### Week 6: Heterogeneous Graph Construction + Fusion
+
+**Build:**
+
+```python
+class HeterogeneousGraph:
+    """
+    Extends the Phase 1 dependency graph with metric nodes.
+    
+    Graph structure:
+    - Service nodes: same as Phase 1
+    - Metric nodes: one per (service, metric_name) pair
+    - Edges:
+      - service→service: call dependencies (from traces)
+      - service→metric: "service S exposes metric M" (ownership)
+      - metric→service: "metric M influences assessment of S" (reverse)
+    """
+    
+    def build(self, traces: List[Trace], 
+              metric_scores: Dict[str, Dict[str, float]]) -> nx.DiGraph:
+        G = nx.DiGraph()
+        
+        # Step 1: Add service nodes and call edges (from Phase 1)
+        dep_graph = self.build_dependency_graph(traces)
+        G.add_nodes_from(dep_graph.nodes(), type='service')
+        G.add_edges_from(dep_graph.edges(), type='calls')
+        
+        # Step 2: Add metric nodes
+        for service, metrics in metric_scores.items():
+            for metric_name, score in metrics.items():
+                metric_node = f"{service}::{metric_name}"
+                G.add_node(metric_node, type='metric', anomaly_score=score)
+                G.add_edge(service, metric_node, type='owns')
+                G.add_edge(metric_node, service, type='influences')
+        
+        return G
+
+class FusedScorer:
+    """
+    Combines trace-based and metric-based anomaly signals.
+    
+    This is the simplified CHASE fusion.
+    v1: Weighted linear combination.
+    v2: Attention-based (learn the weights).
+    """
+    
+    def score(self, service: str, 
+              trace_score: float,
+              metric_scores: Dict[str, float],
+              graph_centrality: float,
+              alpha=0.4, beta=0.4, gamma=0.2) -> float:
+        """
+        Fused score = α·trace_signal + β·metric_signal + γ·graph_signal
+        
+        - trace_signal: from spectrum scoring (Phase 1)
+        - metric_signal: max anomaly across all metrics for this service
+        - graph_signal: how many other anomalous services depend on this one
+          (upstream services with many affected dependents = more likely root cause)
+        """
+        metric_signal = max(metric_scores.values()) if metric_scores else 0.0
+        
+        return (alpha * trace_score + 
+                beta * metric_signal + 
+                gamma * graph_centrality)
+```
+
+**Key thing to get right:** The fusion weights (α, β, γ) will make or break your tool. Start with equal weights. Then create a calibration script: inject 10 different fault types, see which weights give the best top-1 accuracy, and fix those weights. Don't over-engineer this — in practice, trace and metric signals are roughly equally important, with graph position as a tiebreaker.
+
+#### Week 7: End-to-End Phase 2 + Fault Injection Suite
+
+**Build the fault injection test suite.** This is critical — you can't improve what you can't measure.
+
+```python
+# fault_injector.py — automated fault scenarios for testing
+FAULT_SCENARIOS = [
+    {
+        "name": "CPU saturation on single service",
+        "inject": "kubectl exec {pod} -- stress --cpu 4 --timeout 300s",
+        "expected_root_cause": "inventory-service",
+        "type": "resource"
+    },
+    {
+        "name": "Network latency injection",
+        "inject": "kubectl exec {pod} -- tc qdisc add dev eth0 root netem delay 500ms",
+        "expected_root_cause": "cart-service", 
+        "type": "network"
+    },
+    {
+        "name": "Pod crash (partial)",
+        "inject": "kubectl scale deployment {deployment} --replicas=1",
+        "expected_root_cause": "payment-service",
+        "type": "capacity"
+    },
+    {
+        "name": "Database connection leak",
+        "inject": "custom script that holds open DB connections",
+        "expected_root_cause": "database",
+        "type": "dependency"
+    },
+    {
+        "name": "Error rate spike (bad deploy)",
+        "inject": "kubectl set env deployment/{deployment} BUG=true",
+        "expected_root_cause": "recommendation-service",
+        "type": "software"
+    },
+]
+
+class TestRunner:
+    def run_all(self):
+        results = []
+        for scenario in FAULT_SCENARIOS:
+            # 1. Inject fault
+            self.injector.inject(scenario)
+            # 2. Wait for propagation
+            time.sleep(300)  # 5 minutes
+            # 3. Run pipeline
+            ranked = self.pipeline.run(incident_time=datetime.now())
+            # 4. Check if expected root cause is in top-3
+            top3 = [s for s, _ in ranked[:3]]
+            hit = scenario["expected_root_cause"] in top3
+            results.append({"scenario": scenario["name"], "hit": hit, "ranked": ranked})
+            # 5. Clean up
+            self.injector.cleanup(scenario)
+        
+        # Print results table
+        self.print_results(results)
+```
+
+**Test it:** Run all 5 fault scenarios. Target: ≥4/5 correct in top-3. If you're getting 3/5 or less, the problem is almost certainly in your anomaly detection thresholds, not in the ranking algorithm. Tune the thresholds.
+
+### Phase 2 Output
+
+At the end of Week 7, you should have:
+- A tool that uses **both** traces and metrics
+- A test suite that validates it against 5+ fault types
+- A quantifiable accuracy metric (e.g., "4/5 top-1, 5/5 top-3")
+- The fused scoring clearly outperforming Phase 1's trace-only scoring on metric-heavy faults (like CPU saturation, which Phase 1 can't detect at all)
+
+---
+
+## Phase 3: Causal Graph + Online Updates (Weeks 8–9)
+
+**Goal:** Replace "this service is correlated with the anomaly" with "this service *caused* the anomaly." This is the OCEAN upgrade — your tool now reasons about causation, not just correlation.
+
+### What to Extract from the OCEAN Paper
+
+| Paper Section | What You Need From It | How You'll Use It |
+|---|---|---|
+| Dilated CNN for temporal dependencies | How to detect that metric A changed *before* metric B | This gives you temporal causality: "CPU spike happened 2 minutes before latency spike" |
+| GNN for causal graph learning | How to learn which service anomalies cause which | Replaces your static dependency graph with a learned causal graph |
+| Multi-factor attention | How to weight which metrics matter for which services | Replaces your fixed α, β, γ weights with learned attention weights |
+| Contrastive graph fusion | How to fuse multiple modalities without losing signal | An upgrade over your simple weighted average from Phase 2 |
+
+### What to Actually Build (Pragmatic Version)
+
+Full OCEAN implementation requires training a GNN, which needs labeled incident data you probably don't have. Here's the pragmatic approach:
+
+#### Week 8: Temporal Causality
+
+```python
+class TemporalCausalAnalyzer:
+    """
+    Instead of just "is it anomalous?", ask:
+    "When did it become anomalous, relative to other services?"
+    
+    The service that went anomalous FIRST is more likely the root cause.
+    This is the simplest form of causality: temporal precedence.
+    """
+    
+    def find_anomaly_onset(self, service: str, 
+                           metric: str,
+                           incident_time: datetime) -> Optional[datetime]:
+        """
+        Binary search for the exact time this service's metric
+        crossed the anomaly threshold.
+        
+        1. Check metric at incident_time - 30min → normal
+        2. Check metric at incident_time → anomalous  
+        3. Binary search between these two times
+        4. Return the crossing point
+        """
+        pass
+    
+    def build_temporal_order(self, services: List[str],
+                             incident_time: datetime) -> List[Tuple[str, datetime]]:
+        """
+        For each anomalous service, find its anomaly onset time.
+        Sort by onset time.
+        
+        The earliest anomalous service = most likely root cause.
+        (With a caveat: it could be a service even further upstream
+         that we're not monitoring)
+        """
+        onsets = []
+        for service in services:
+            onset = self.find_anomaly_onset(service, 'cpu', incident_time)
+            if onset:
+                onsets.append((service, onset))
+        
+        return sorted(onsets, key=lambda x: x[1])  # earliest first
+    
+    def granger_causality(self, service_a: str, service_b: str,
+                          metric: str, window: int = 60) -> float:
+        """
+        Simplified Granger causality test:
+        "Does knowing service A's metric history help predict 
+         service B's metric values better than just B's own history?"
+        
+        If yes → A Granger-causes B → A is likely upstream root cause
+        
+        Implementation: 
+        1. Fit AR model on B's metric alone → error_e1
+        2. Fit AR model on B's metric + A's metric → error_e2
+        3. Granger score = (e1 - e2) / e1
+           (how much does adding A's data reduce prediction error?)
+        """
+        pass
+```
+
+**Key thing to get right:** Granger causality is a *weak* form of causality — it only captures temporal precedence, not true causation. But it's surprisingly effective in microservices because failures really do propagate forward in time. A service can't be affected before the service it depends on fails. Use Granger causality as a *filter*: if A doesn't Granger-cause B, you can eliminate the hypothesis that A's failure caused B's failure.
+
+#### Week 9: Causal Graph Construction
+
+```python
+class CausalGraphBuilder:
+    """
+    Builds a causal graph from:
+    1. Service dependency graph (from traces) — structural prior
+    2. Temporal ordering (from Phase 3, Week 8) — time-based evidence  
+    3. Granger causality scores — statistical evidence
+    
+    Key insight from OCEAN: the dependency graph is a PRIOR,
+    not the final answer. Some dependencies are inactive during
+    normal operation. The causal graph only includes edges that
+    are ACTIVE during the incident.
+    """
+    
+    def build(self, dependency_graph: nx.DiGraph,
+              temporal_order: List[Tuple[str, datetime]],
+              granger_scores: Dict[Tuple[str, str], float]) -> nx.DiGraph:
+        
+        causal_graph = nx.DiGraph()
+        causal_graph.add_nodes_from(dependency_graph.nodes())
+        
+        # Only keep dependency edges that are causally active
+        for u, v in dependency_graph.edges():
+            # Edge u→v is causal if:
+            # 1. u became anomalous BEFORE v (temporal)
+            # 2. u Granger-causes v (statistical)
+            
+            u_onset = dict(temporal_order).get(u)
+            v_onset = dict(temporal_order).get(v)
+            
+            temporal_causal = (u_onset and v_onset and u_onset < v_onset)
+            granger_causal = granger_scores.get((u, v), 0) > 0.1
+            
+            if temporal_causal and granger_causal:
+                # Strong evidence: both signals agree
+                causal_graph.add_edge(u, v, confidence='high')
+            elif temporal_causal or granger_causal:
+                # Weaker evidence: only one signal
+                causal_graph.add_edge(u, v, confidence='low')
+            # else: skip this edge — no evidence it's causal
+        
+        return causal_graph
+```
+
+**Key thing to get right:** Your causal graph will be *sparser* than your dependency graph. That's the point. The dependency graph shows all possible call paths. The causal graph shows which paths *actually transmitted the failure*. A sparse, accurate causal graph is much more useful than a dense dependency graph.
+
+**Test it:** Inject the Black Friday scenario (database connection leak from inventory-service). Your causal graph should have:
+- ✅ `inventory-service → database` (high confidence)
+- ✅ `database → payment-service` (high confidence)
+- ❌ No edge from `email-service → database` (email isn't causing DB issues, it's a victim)
+
+### Phase 3 Output
+
+- Causal graph that correctly identifies failure propagation paths
+- Temporal ordering that disambiguates "who failed first"
+- Your tool now answers "what caused this" not just "what's correlated with this"
+
+---
+
+## Phase 4: Reasoning Layer + Dashboard (Weeks 10–11)
+
+**Goal:** Make the output explainable and actionable. This is where ThinkFL's Recursion-of-Thought concept comes in — but you'll implement a deterministic version rather than using an LLM.
+
+### What to Extract from ThinkFL
+
+| Paper Section | What You Need From It | How You'll Use It |
+|---|---|---|
+| Recursion-of-Thought (Section 4.1.2) | The idea of iterative hypothesis refinement | Your "reasoning path" display — showing how the tool arrived at its conclusion |
+| Multi-Factor Grader (Section 4.2) | How to score a root cause hypothesis from multiple angles | Your confidence scoring — combining trace, metric, temporal, and causal evidence |
+| Hallucination Penalty (Section 4.2.3) | Don't output root causes that aren't supported by evidence | Your evidence requirement — every root cause must link to specific data |
+
+### Week 10: Reasoning Path Generation
+
+```python
+class ReasoningPathGenerator:
+    """
+    Generates the "why" behind each root cause ranking.
+    Instead of just "inventory-service (94% confidence)", produces:
+    
+    1. inventory-service → CPU normal, but connection pool: 300/10 (anomalous)
+    2. inventory-service → database: connections exhausted 2 min after pool spike
+    3. database → payment-service: timeouts started 3 min after DB saturation
+    4. payment-service → cart-service: checkout failures 4 min after payment timeouts
+    5. cart-service → frontend: user-facing errors 5 min after cart failures
+    
+    This is the "propagation path" from your mockup.
+    """
+    
+    def generate_path(self, root_cause: str,
+                      causal_graph: nx.DiGraph,
+                      temporal_order: List[Tuple[str, datetime]],
+                      metric_evidence: Dict[str, Dict[str, float]],
+                      trace_evidence: Dict[str, float]) -> List[dict]:
+        
+        path = []
+        # BFS from root cause through causal graph
+        visited = {root_cause}
+        queue = [root_cause]
+        
+        while queue:
+            current = queue.pop(0)
+            neighbors = list(causal_graph.successors(current))
+            
+            for neighbor in neighbors:
+                if neighbor not in visited:
+                    step = {
+                        "from": current,
+                        "to": neighbor,
+                        "causal_confidence": causal_graph[current][neighbor].get("confidence", "low"),
+                        "time_delay": self._time_between(current, neighbor, temporal_order),
+                        "evidence": self._collect_evidence(
+                            neighbor, metric_evidence, trace_evidence
+                        )
+                    }
+                    path.append(step)
+                    visited.add(neighbor)
+                    queue.append(neighbor)
+        
+        return path
+    
+    def _collect_evidence(self, service, metric_evidence, trace_evidence):
+        """
+        For each service in the path, collect concrete evidence:
+        - Which metrics are anomalous and by how much?
+        - How many traces show this service as slow/errored?
+        - When did the anomaly start?
+        """
+        evidence = []
+        
+        for metric, score in metric_evidence.get(service, {}).items():
+            if score > 3.0:  # > 3 sigma
+                evidence.append({
+                    "type": "metric",
+                    "metric": metric,
+                    "severity": f"{score:.1f}σ from baseline",
+                    "detail": self._get_metric_detail(service, metric)
+                })
+        
+        trace_score = trace_evidence.get(service, 0)
+        if trace_score > 0.3:
+            evidence.append({
+                "type": "trace",
+                "severity": f"appears in {trace_score:.0%} of anomalous traces",
+            })
+        
+        return evidence
+
+
+class MultiFactorConfidence:
+    """
+    ThinkFL's Multi-Factor Grader, simplified.
+    
+    Confidence is NOT just the anomaly score.
+    It's a combination of:
+    1. Anomaly strength (how far from normal?)
+    2. Causal evidence (how many downstream services are affected?)
+    3. Temporal consistency (did this service fail first?)
+    4. Evidence consistency (do traces AND metrics agree?)
+    """
+    
+    def compute(self, service: str,
+                anomaly_score: float,
+                downstream_affected: int,
+                is_earliest: bool,
+                signals_agree: bool) -> float:
+        """
+        Returns 0-100 confidence score.
+        """
+        score = 0
+        
+        # Factor 1: Anomaly strength (0-30 points)
+        score += min(anomaly_score * 10, 30)
+        
+        # Factor 2: Downstream impact (0-25 points)
+        # Root causes affect many downstream services
+        score += min(downstream_affected * 5, 25)
+        
+        # Factor 3: Temporal priority (0-25 points)
+        if is_earliest:
+            score += 25
+        elif is_earliest is False:  # explicitly not earliest
+            score += 5  # small credit for being close to earliest
+        
+        # Factor 4: Multi-signal agreement (0-20 points)
+        if signals_agree:
+            score += 20
+        
+        return min(score, 100)
+```
+
+**Key thing to get right:** Every claim must link to evidence. If your tool says "inventory-service connection pool is exhausted," clicking on that should show the Prometheus chart with connections=300 vs baseline=10. SREs will not trust a tool that makes claims without evidence. This is the single biggest adoption barrier.
+
+#### Week 11: Dashboard
+
+**Build a web dashboard.** Use Streamlit or Gradio for speed — don't build a React app from scratch.
+
+```
+Dashboard Layout:
+┌────────────────────────────────────────────────────────────┐
+│  🔴 Active Incident                    [Time: 02:14 AM]   │
+├────────────────────────────────────────────────────────────┤
+│                                                            │
+│  ROOT CAUSE: inventory-service                    94%      │
+│  ─────────────────────────────────────────────             │
+│                                                            │
+│  Propagation Path:                    [Interactive Graph]  │
+│  ┌─────────────┐    ┌──────┐    ┌─────────┐               │
+│  │ inventory   │───▶│  DB  │───▶│ payment │               │
+│  │ connection  │    │ sat. │    │ timeout │               │
+│  │ pool=300    │    │      │    │         │               │
+│  └─────────────┘    └──────┘    └────┬────┘               │
+│                                      │                     │
+│                                 ┌────▼────┐               │
+│                                 │  cart   │               │
+│                                 │  errors │               │
+│                                 └────┬────┘               │
+│                                      │                     │
+│                                 ┌────▼────┐               │
+│                                 │frontend │               │
+│                                 │  5xx ↑  │               │
+│                                 └─────────┘               │
+│                                                            │
+│  Evidence:                          [Click any node ↑]     │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │ inventory-service                                   │  │
+│  │ ├─ connection_pool_active: 300 (baseline: 10) 📈    │  │
+│  │ ├─ Appears in 94% of anomalous traces               │  │
+│  │ ├─ Anomaly onset: 02:12:17 (earliest)               │  │
+│  │ └─ CPU: normal | Memory: normal | Errors: normal    │  │
+│  └─────────────────────────────────────────────────────┘  │
+│                                                            │
+│  [Export Postmortem]  [View Raw Data]  [Run Again]        │
+└────────────────────────────────────────────────────────────┘
+```
+
+**Key dashboard features:**
+1. **Interactive causal graph** — click any node to see its evidence
+2. **Timeline view** — show anomaly onset times for all services on a single timeline
+3. **Metric sparklines** — tiny inline charts showing the anomaly burst
+4. **One-click postmortem export** — generates a markdown incident report
+
+### Phase 4 Output
+
+- A working web dashboard that shows root cause + propagation path + evidence
+- An SRE can look at it and immediately know what to do
+- Postmortem export that documents the incident automatically
+
+---
+
+## Phase 5: Evaluation + Polish (Week 12)
+
+**Goal:** Prove your tool works and make it presentable.
+
+### Evaluation Against [RCAEval](https://arxiv.org/abs/2412.17015v5)
+
+Use the RCAEval benchmark datasets if available. If not, use your own fault injection suite but make it rigorous:
+
+| Metric | What It Measures | Target |
+|---|---|---|
+| Top-1 Accuracy | Is the #1 ranked service the actual root cause? | ≥ 60% |
+| Top-3 Accuracy | Is the root cause in the top 3? | ≥ 80% |
+| Top-5 Accuracy | Is the root cause in the top 5? | ≥ 90% |
+| Mean Time to Detection | How fast does your tool identify the root cause? | ≤ 2 min after anomaly start |
+| False Positive Rate | How often does it flag a healthy service? | ≤ 10% |
+
+### Polish Checklist
+
+- **README.md**: Problem statement, architecture diagram, setup instructions, demo GIF
+- **Docker Compose**: One-command setup of the entire stack
+- **Demo Script**: Automated fault injection + detection sequence for presentations
+- **Comparison Table**: Your tool vs. MicroRank (trace-only) vs. random guessing on the same test scenarios
+
+---
+
+## Learning Roadmap (Parallel to Building)
+
+These are things to study alongside each phase, not before starting:
+
+| Week | Study Topic | Resource | Why You Need It |
+|---|---|---|---|
+| 1-2 | OpenTelemetry + Jaeger API | [OTel docs](https://opentelemetry.io/docs/) + [Jaeger API](https://www.jaegertracing.io/docs/latest/api/) | You need to fetch and parse traces |
+| 2-3 | Graph algorithms | NetworkX tutorials on [PageRank](https://networkx.org/documentation/stable/reference/algorithms/generated/networkx.algorithms.link_analysis.pagerank_alg.pagerank.html) | Core ranking algorithm |
+| 3-4 | Spectrum-based fault localization | MicroRank paper §3.2 | The scoring formula |
+| 5-6 | Time series anomaly detection | [PromQL docs](https://prometheus.io/docs/prometheus/latest/querying/basics/) + basic statistics (z-scores, MAD) | Metric anomaly detection |
+| 7-8 | Granger causality | Statsmodels [grangercausalitytests](https://www.statsmodels.org/stable/generated/statsmodels.tsa.stattools.grangercausalitytests.html) | Temporal causality |
+| 8-9 | Causal inference basics | [Causal Inference: What If](https://www.hsph.harvard.edu/miguel-hernan/causal-inference-book/) Chapter 1-3 (free) | Understanding causation vs correlation |
+| 10-11 | Streamlit or Gradio | Official tutorials | Building the dashboard |
+
+---
+
+## Critical Pitfalls to Watch For
+
+### 1. The "Frontend Is Always #1" Problem
+PageRank naturally favors highly-connected nodes. In microservices, the frontend/gateway is connected to everything, so it always ranks high. **Fix:** The personalization vector in Phase 1 is essential. Without it, your tool will always say "the frontend is the root cause."
+
+### 2. The "Everything Looks Broken" Problem
+When the database fails, every service that uses the database looks anomalous. Your spectrum scorer will flag all of them. **Fix:** The temporal ordering from Phase 3 is the key differentiator — the database's metrics will spike *before* the services that depend on it.
+
+### 3. The "Stale Baseline" Problem
+If you compare against metrics from before a deployment, the baseline is wrong. **Fix:** Always use a sliding window baseline (e.g., the 30 minutes immediately before the incident). Never use fixed historical baselines.
+
+### 4. The "Circular Dependency" Problem
+Service A calls B, B calls A (common with retries). PageRank handles this fine, but Granger causality doesn't — it assumes no cycles. **Fix:** For Phase 3, use the dependency graph as a structural prior to break cycles. Only compute Granger causality along edges that exist in the dependency graph.
+
+### 5. The "Threshold Sensitivity" Problem
+Your anomaly detection thresholds (what z-score counts as "anomalous"?) will need constant tuning. **Fix:** Make them configurable per-service and per-metric. Start with z=3 (99.7% confidence under normality), then adjust based on your test results.
+
+---
+
+## Summary Timeline
+
+| Week | Phase | Deliverable | Key Risk |
+|---|---|---|---|
+| 1 | Foundation | K8s + observability stack + demo app | Getting Jaeger/Prometheus connected |
+| 2-4 | Phase 1: MicroRank Core | Trace-based root cause ranking | Personalized PageRank implementation |
+| 5-7 | Phase 2: Multi-Modal | Trace + metric fusion + test suite | Fusion weights and threshold tuning |
+| 8-9 | Phase 3: Causal Graph | Temporal causality + causal edges | Granger causality on noisy data |
+| 10-11 | Phase 4: Reasoning + UI | Dashboard with evidence display | Making it actually explain its reasoning |
+| 12 | Phase 5: Evaluation | Benchmark results + polished repo | Proving it beats the baseline |
+
+Start with Phase 0 this week. Get the observability stack running. Everything else builds on top of that.
