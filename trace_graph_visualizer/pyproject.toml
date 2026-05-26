@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend.name = "setuptools.build_meta"
+
+[project]
+name = "trace-graph-visualizer"
+version = "0.1.0"
+description = "Build service dependency graphs from Jaeger traces"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "networkx>=3.0",
+    "requests>=2.31.0",
+]
+
+[project.scripts]
+trace-graph = "trace_graph_visualizer.cli:main"
+
+[tool.setup.packages]
+trace_graph_visualizer = "trace_graph_visualizer"
+
+[tool.setup.package-data]
+trace_graph_visualizer = ["py.typed"]

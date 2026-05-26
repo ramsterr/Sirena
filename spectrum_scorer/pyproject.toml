@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend.name = "setuptools.build_meta"
+
+[project]
+name = "spectrum-scorer"
+version = "0.1.0"
+description = "Spectrum-based fault localization library using Ochiai, Tarantula, Jaccard, and DStar formulas"
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Debugging",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = []
+
+[project.scripts]
+spectrum-score = "spectrum_scorer.cli:main"
+
+[tool.setup.packages]
+spectrum_scorer = "spectrum_scorer"
+
+[tool.setup.package-data]
+spectrum_scorer = ["py.typed"]

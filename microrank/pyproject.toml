@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend.name = "setuptools.build_meta"
+
+[project]
+name = "microrank"
+version = "0.1.0"
+description = "Trace-based root cause analysis using spectrum scoring and Personalized PageRank"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "networkx>=3.0",
+    "requests>=2.31.0",
+]
+
+[project.scripts]
+micro-rank = "microrank.cli:main"
+
+[tool.setup.packages]
+microrank = "microrank"
