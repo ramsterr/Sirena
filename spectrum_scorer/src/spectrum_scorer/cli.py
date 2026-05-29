@@ -16,12 +16,19 @@ def main():
     score_cmd.add_argument("--formula", "-f", default="ochiai",
                           choices=["ochiai", "tarantula", "jaccard", "dstar"],
                           help="Scoring formula (default: ochiai)")
+    score_cmd.add_argument("--temporal-half-life", type=float, default=None,
+                          help="Half-life in seconds for temporal weighting "
+                               "(earlier failures weighted higher)")
     score_cmd.add_argument("--output-format", "-o", default="text",
                           choices=["text", "json", "csv"],
                           help="Output format (default: text)")
+    score_cmd.add_argument("--output", default=None,
+                          help="Write output to file instead of stdout")
 
     compare_cmd = sub.add_parser("compare", help="Compare all formulas on a JSON file")
     compare_cmd.add_argument("--input", "-i", required=True, help="Input JSON file")
+    compare_cmd.add_argument("--temporal-half-life", type=float, default=None,
+                             help="Half-life in seconds for temporal weighting")
 
     args = parser.parse_args()
 
@@ -34,19 +41,20 @@ def main():
 def run_score(args):
     data = json.loads(Path(args.input).read_text())
     executions = [Execution(**e) for e in data["executions"]]
-    scorer = SpectrumScorer(formula=args.formula)
-    ranked = scorer.rank(executions)
+    scorer = SpectrumScorer(
+        formula=args.formula,
+        temporal_half_life=args.temporal_half_life,
+    )
+    result = scorer.score(executions)
+    ranked = list(result.scores.items())
 
-    if args.output_format == "json":
-        result = [{"component": c, "score": s} for c, s in ranked]
-        print(json.dumps(result, indent=2))
-    elif args.output_format == "csv":
-        print("component,score")
-        for c, s in ranked:
-            print(f"{c},{s}")
+    out_lines = _format_output(ranked, args.output_format)
+
+    if args.output:
+        Path(args.output).write_text("\n".join(out_lines) + "\n")
     else:
-        for comp, score in ranked:
-            print(f"{score:.4f}  {comp}")
+        for line in out_lines:
+            print(line)
 
 
 def run_compare(args):
@@ -54,11 +62,25 @@ def run_compare(args):
     executions = [Execution(**e) for e in data["executions"]]
 
     for formula in ["ochiai", "tarantula", "jaccard", "dstar"]:
-        scorer = SpectrumScorer(formula=formula)
-        ranked = scorer.rank(executions)
+        scorer = SpectrumScorer(
+            formula=formula,
+            temporal_half_life=args.temporal_half_life,
+        )
+        result = scorer.score(executions)
+        ranked = list(result.scores.items())
         print(f"=== {formula} ===")
         for comp, score in ranked:
             print(f"  {score:.4f}  {comp}")
+
+
+def _format_output(ranked, output_format):
+    if output_format == "json":
+        return [json.dumps(
+            [{"component": c, "score": s} for c, s in ranked], indent=2)]
+    elif output_format == "csv":
+        return ["component,score"] + [f"{c},{s}" for c, s in ranked]
+    else:
+        return [f"{score:.4f}  {comp}" for comp, score in ranked]
 
 
 if __name__ == "__main__":

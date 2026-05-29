@@ -1,7 +1,7 @@
 """Tests for spectrum scoring formulas."""
 import pytest
 from spectrum_scorer.models import Execution
-from spectrum_scorer.scorer import SpectrumScorer
+from spectrum_scorer.scorer import SpectrumScorer, ScoreResult
 
 
 class TestOchiai:
@@ -12,26 +12,73 @@ class TestOchiai:
             Execution(components=["frontend", "cart"], is_failing=False),
             Execution(components=["frontend", "cart"], is_failing=False),
         ]
-        scores = SpectrumScorer(formula="ochiai").score(executions)
+        result = SpectrumScorer(formula="ochiai").score(executions)
+        assert isinstance(result, ScoreResult)
+        scores = result.scores
         assert abs(scores["database"] - 1.0) < 0.01
         assert abs(scores["frontend"] - 0.7071) < 0.01
+        assert result.formula_used == "ochiai"
 
     def test_all_failing_contains_component(self):
         executions = [
             Execution(components=["svc"], is_failing=True),
             Execution(components=["svc"], is_failing=True),
         ]
-        assert SpectrumScorer(formula="ochiai").score(executions)["svc"] == 1.0
+        result = SpectrumScorer(formula="ochiai").score(executions)
+        assert result.scores["svc"] == 1.0
 
     def test_component_only_in_passing(self):
         executions = [
             Execution(components=["svc"], is_failing=False),
             Execution(components=["svc"], is_failing=False),
         ]
-        assert SpectrumScorer(formula="ochiai").score(executions)["svc"] == 0.0
+        result = SpectrumScorer(formula="ochiai").score(executions)
+        assert result.scores["svc"] == 0.0
 
     def test_empty_executions(self):
-        assert SpectrumScorer(formula="ochiai").score([]) == {}
+        result = SpectrumScorer(formula="ochiai").score([])
+        assert result.scores == {}
+        assert result.n_f == 0.0
+        assert result.n_p == 0.0
+
+    def test_no_failing_executions(self):
+        executions = [
+            Execution(components=["A", "B"], is_failing=False),
+            Execution(components=["C"], is_failing=False),
+        ]
+        result = SpectrumScorer(formula="ochiai").score(executions)
+        assert result.n_f == 0.0
+        for v in result.scores.values():
+            assert v == 0.0
+
+
+class TestOchiaiWalkThrough:
+    def test_spec_example(self):
+        executions = []
+        for _ in range(19):
+            executions.append(Execution(
+                components=["frontend", "inventory-service"],
+                is_failing=True,
+            ))
+        for _ in range(5):
+            executions.append(Execution(
+                components=["frontend", "inventory-service"],
+                is_failing=False,
+            ))
+        for _ in range(1):
+            executions.append(Execution(
+                components=["frontend"],
+                is_failing=True,
+            ))
+        for _ in range(75):
+            executions.append(Execution(
+                components=["frontend"],
+                is_failing=False,
+            ))
+
+        result = SpectrumScorer(formula="ochiai").score(executions)
+        assert abs(result.scores["inventory-service"] - 0.868) < 0.02
+        assert abs(result.scores["frontend"] - 0.447) < 0.02
 
 
 class TestTarantula:
@@ -42,9 +89,18 @@ class TestTarantula:
             Execution(components=["A"], is_failing=False),
             Execution(components=["A"], is_failing=False),
         ]
-        scores = SpectrumScorer(formula="tarantula").score(executions)
+        result = SpectrumScorer(formula="tarantula").score(executions)
+        scores = result.scores
         assert abs(scores["B"] - 1.0) < 0.01
         assert abs(scores["A"] - 0.5) < 0.01
+
+    def test_denominator_zero(self):
+        executions = [
+            Execution(components=["X"], is_failing=False),
+            Execution(components=["Y"], is_failing=True),
+        ]
+        result = SpectrumScorer(formula="tarantula").score(executions)
+        assert result.scores["X"] == 0.0
 
 
 class TestJaccard:
@@ -53,7 +109,8 @@ class TestJaccard:
             Execution(components=["svc"], is_failing=True),
             Execution(components=["svc"], is_failing=True),
         ]
-        assert SpectrumScorer(formula="jaccard").score(executions)["svc"] == 1.0
+        result = SpectrumScorer(formula="jaccard").score(executions)
+        assert result.scores["svc"] == 1.0
 
 
 class TestDStar:
@@ -65,8 +122,60 @@ class TestDStar:
             Execution(components=["A", "B"], is_failing=False),
             Execution(components=["B"], is_failing=False),
         ]
-        scores = SpectrumScorer(formula="dstar").score(executions)
-        assert scores["A"] > scores["B"]
+        result = SpectrumScorer(formula="dstar").score(executions)
+        assert result.scores["A"] > result.scores["B"]
+
+    def test_all_failing_no_passing(self):
+        executions = [
+            Execution(components=["svc"], is_failing=True),
+            Execution(components=["svc"], is_failing=True),
+            Execution(components=["svc"], is_failing=True),
+        ]
+        result = SpectrumScorer(formula="dstar").score(executions)
+        assert result.scores["svc"] == 9.0
+
+
+class TestTemporalWeighting:
+    def test_earlier_failures_weighted_higher(self):
+        executions = [
+            Execution(components=["A"], is_failing=True, timestamp=0.0),
+            Execution(components=["B"], is_failing=True, timestamp=100.0),
+        ]
+        scorer = SpectrumScorer(formula="ochiai", temporal_half_life=50)
+        result = scorer.score(executions)
+        assert result.scores["A"] > result.scores["B"]
+
+    def test_fallback_with_missing_timestamps(self):
+        executions = [
+            Execution(components=["A"], is_failing=True, timestamp=0.0),
+            Execution(components=["B"], is_failing=True, timestamp=None),
+        ]
+        scorer = SpectrumScorer(formula="ochiai", temporal_half_life=50)
+        result = scorer.score(executions)
+        assert not result.temporal
+
+    def test_all_same_timestamp(self):
+        executions = [
+            Execution(components=["A"], is_failing=True, timestamp=10.0),
+            Execution(components=["B"], is_failing=True, timestamp=10.0),
+        ]
+        scorer = SpectrumScorer(formula="ochiai", temporal_half_life=50)
+        result = scorer.score(executions)
+        assert result.scores["A"] == result.scores["B"]
+
+
+class TestScoreResult:
+    def test_metadata(self):
+        executions = [
+            Execution(components=["A"], is_failing=True),
+            Execution(components=["A"], is_failing=False),
+            Execution(components=["A"], is_failing=False),
+        ]
+        result = SpectrumScorer(formula="ochiai").score(executions)
+        assert result.formula_used == "ochiai"
+        assert result.n_f == 1.0
+        assert result.n_p == 2.0
+        assert not result.temporal
 
 
 class TestRank:

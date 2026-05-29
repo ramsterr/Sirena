@@ -1,0 +1,328 @@
+# Project 6: SRE Incident Console — Build Reference
+
+> This document is the canonical reference for building a web dashboard for incident investigation. It is a standalone, shippable project that contributes to Phase 4 of the SRE Root Cause Analysis Tool. Use this as the source of truth when prompting for implementation help. This project merges and enhances subprojects #7 (Microservice Health Dashboard) and #8 (Postmortem Generator) into one unified console.
+
+---
+
+## Meta-Structure: How to Read This Document
+
+This project contains these sections:
+
+- **Real Objective** — What you are *actually* trying to accomplish, stated in plain English.
+- **Tool Objective** — What the software must do at the end. This is the acceptance test.
+- **What You Must Understand Before Coding** — Concepts, their internals, and why they matter.
+- **What to Study and Where** — Specific resources, specific sections, specific things to extract.
+- **What to Code** — Each component, its purpose, inputs, outputs, internals, and verification.
+- **How the Pieces Connect** — Data flow showing how components connect.
+- **Understanding Checkpoints** — Concrete things you should be able to explain before moving on.
+- **Common Mistakes** — What people get wrong and how to avoid it.
+- **Ship Criteria** — What makes this project ready to publish and share.
+
+---
+
+## Real Objective
+
+You are building the face of the entire SRE RCA pipeline — a web dashboard that an on-call engineer can open during an incident (or review afterward) to understand exactly what happened. It transforms the algorithmic outputs from Projects 2-5 into a visual investigation tool where every claim is backed by clickable evidence.
+
+Think of it like a hospital's patient monitoring board combined with a detective's evidence wall. At-a-glance: which services are healthy and which are critical. On investigation: the full causal chain, metric charts, trace statistics, onset times, and confidence breakdowns — all linked to raw data so the SRE can verify every claim.
+
+The dashboard also produces postmortems — automatically filling in the root cause, timeline, affected services, and evidence from the pipeline, so the SRE only needs to add lessons learned and action items.
+
+## Tool Objective
+
+By the end of this project, the dashboard must:
+1. Display all services with real-time health status (healthy / degraded / critical) color-coded
+2. Show key metrics per service (CPU, memory, latency, error rate) with sparkline charts
+3. Auto-refresh every 30 seconds with live data from Prometheus
+4. Accept an incident timestamp and run the full RCA pipeline (Projects 2-5), displaying the result
+5. Show an interactive causal graph — click any node to see its evidence panel
+6. Display a propagation path timeline with time delays and confidence
+7. Show a multi-factor confidence breakdown (anomaly strength / downstream impact / temporal priority / signal agreement)
+8. Generate and export a structured markdown postmortem with one click
+9. Support custom postmortem templates via Jinja2
+
+## What You Must Understand Before Coding
+
+### Concept 1: Desktop Layout Philosophy
+
+The console has TWO modes:
+
+**Live Health View** (no incident selected): Shows all services with current health status. The SRE opens this proactively and sees at-a-glance if anything is degraded.
+
+**Incident Investigation View** (incident timestamp entered): Shows root cause, causal graph, propagation path, evidence panels, confidence breakdown. The SRE enters an incident time and the console runs the full pipeline.
+
+The layout:
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  SRE Incident Console                     [Live] [Investigate]  │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  LIVE VIEW (default):                                            │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ Summary: 11 services | 🟢 8 healthy | 🟡 2 degraded | 🔴 1 │ │
+│  ├────────────────────────────────────────────────────────────┤ │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐      │ │
+│  │  │ frontend │ │ cart     │ │ payment  │ │ database │      │ │
+│  │  │ 🟢       │ │ 🟡       │ │ 🔴       │ │ 🟢       │      │ │
+│  │  │ CPU:45%  │ │ CPU:78%  │ │ CPU:92%  │ │ CPU:30%  │      │ │
+│  │  │ Lat:200ms│ │ Lat:800ms│ │ Lat:2s   │ │ Lat:50ms │      │ │
+│  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘      │ │
+│  │  ... (more services in 4-column grid)                      │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                  │
+│  INVESTIGATION VIEW (when incident time entered):                │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │ 🔴 Active Incident: 2026-05-26 02:14 AM                     │ │
+│  │                                                             │ │
+│  │ ROOT CAUSE: database                         Confidence: 88%│ │
+│  │ ┌─────────────────────────────────────────────────────────┐│ │
+│  │ │ Anomaly Strength: 28/30 | Downstream Impact: 20/25     ││ │
+│  │ │ Temporal Priority: 25/25 | Multi-Signal: 15/20         ││ │
+│  │ └─────────────────────────────────────────────────────────┘│ │
+│  │                                                             │ │
+│  │ Propagation Path:                   [Interactive Graph]     │ │
+│  │ database ─→ payment ─→ cart ─→ frontend                     │ │
+│  │ (click any node ↓)                                          │ │
+│  │                                                             │ │
+│  │ Evidence: database                                           │ │
+│  │ ├─ CPU: 92% (baseline: 45%, z=4.1) 🔴                       │ │
+│  │ ├─ Memory: 512MB (baseline: 498MB, z=1.1) 🟢                │ │
+│  │ ├─ Latency P95: 1200ms (baseline: 200ms, z=5.8) 🔴          │ │
+│  │ ├─ Error Rate: 0.02% (baseline: 0.01%, z=0.3) 🟢            │ │
+│  │ ├─ Trace Ochiai: 0.89 (appears in 94% of anomalous traces)  │ │
+│  │ └─ Anomaly Onset: 02:12:17 (earliest anomalous service)     │ │
+│  │                                                             │ │
+│  │ [Export Postmortem]  [View Raw JSON]  [Clear]               │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Concept 2: Multi-Factor Confidence Scoring
+
+Confidence is NOT just the anomaly score. It's four dimensions (from plan3.txt Phase 4):
+
+| Factor | Weight | What It Measures |
+|---|---|---|
+| **Anomaly Strength** | 0–30 pts | How far from normal? Max z-score + Ochiai score |
+| **Downstream Impact** | 0–25 pts | How many services were affected? Count of reachable nodes in causal graph |
+| **Temporal Priority** | 0–25 pts | Did this service fail FIRST? 25 pts if earliest, 15 if top-3, 5 otherwise |
+| **Multi-Signal Agreement** | 0–20 pts | Do traces AND metrics agree? 20 if both flag, 10 if one, 0 if neither |
+
+This breakdown gives the SRE a reason to trust (or distrust) the result. "88% — because anomaly was very strong (28/30), affected many services (20/25), was the earliest failure (25/25), and traces + metrics agree (15/20)" is actionable. "88%" alone is useless.
+
+### Concept 3: Postmortem Generation with Jinja2
+
+The postmortem generator takes all the investigation data and fills a template:
+
+```jinja2
+# Incident Postmortem: {{ incident_time }}
+
+## Summary
+On {{ incident_time }}, {{ root_cause }} experienced {{ issue_description }},
+causing cascading failures across {{ affected_services|join(", ") }},
+impacting users for {{ duration }}.
+
+## Impact
+{% for svc in affected_services %}
+- **{{ svc.name }}**: {{ svc.impact_description }}
+{% endfor %}
+
+## Timeline
+| Time | Service | Event | Evidence |
+|------|---------|-------|----------|
+{% for step in propagation_path %}
+| {{ step.onset }} | {{ step.service }} | {{ step.event }} | {{ step.evidence }} |
+{% endfor %}
+
+## Root Cause
+{{ root_cause }} — {{ root_cause_detail }}
+
+## Resolution
+[TO BE FILLED BY ON-CALL ENGINEER]
+
+## Lessons Learned
+### What Went Well
+- [TO BE FILLED]
+### What Went Wrong
+- [TO BE FILLED]
+
+## Action Items
+| Task | Owner | Due |
+|------|-------|-----|
+| [TO BE FILLED] | | |
+```
+
+The auto-filled sections (everything except lessons learned, resolution, and action items) come directly from the pipeline output. The SRE only needs to add qualitative reflection.
+
+## What to Study and Where
+
+| What | Where | What to Extract |
+|---|---|---|
+| Streamlit basics | [Streamlit docs](https://docs.streamlit.io/) | `st.metric`, `st.columns`, `st.expander`, `st.line_chart`, `st.rerun` for auto-refresh. |
+| Streamlit-agraph | [streamlit-agraph docs](https://github.com/ChrisChross/streamlit-agraph) | Interactive graph rendering with clickable nodes. Alternative to pyvis for Streamlit. |
+| Jinja2 templating | [Jinja2 docs](https://jinja.palletsprojects.com/) | Template rendering for postmortem markdown. Custom template support. |
+| Prometheus API | [Prometheus API docs](https://prometheus.io/docs/prometheus/latest/querying/api/) | Instant queries for live health metrics. |
+| Plotly in Streamlit | [Plotly + Streamlit](https://docs.streamlit.io/library/api-reference/charts/st.plotly_chart) | Metric charts with anomaly region highlighting. |
+
+## What to Code
+
+### Component 6.1: Live Health Overview
+
+**Purpose:** Display all services with real-time health status and key metrics.
+
+**Data source:** Prometheus instant queries (not historical range queries). 4 metrics per service.
+
+**Health thresholds:**
+- **Healthy (green):** All metric z-scores < 2
+- **Degraded (yellow):** One or more 2 ≤ z-score < 3
+- **Critical (red):** One or more z-score ≥ 3
+
+Use `st.columns(4)` for a service card grid. Each card shows:
+- Service name + status emoji (🟢🟡🔴)
+- CPU %, Memory MB, Latency ms, Error Rate % — each as `st.metric`
+- Max z-score across all metrics
+- Click to expand → full metric time series chart
+
+Auto-refresh every 30 seconds via `st.rerun()` + `time.sleep(30)`.
+
+### Component 6.2: Incident Investigator
+
+**Purpose:** Run the full RCA pipeline and display results interactively.
+
+**Pipeline integration:**
+```
+st.text_input("Incident timestamp") → calls:
+  1. Project 1 (topology-map) → dependency graph JSON
+  2. Project 2 (microrank) → Ochiai scores
+  3. Project 4 (rca-detect) → metric anomalies + fused ranking
+  4. Project 5 (causal-trace) → causal graph + propagation path
+  → Renders all output in the investigation view
+```
+
+**Key UI elements:**
+1. **Root cause banner** — top of page, large text, confidence score
+2. **Confidence breakdown** — 4-factor horizontal bar chart (anomaly strength, downstream impact, temporal priority, signal agreement)
+3. **Interactive causal graph** — nodes are services, edges are causal links with confidence label. Click node → evidence panel updates
+4. **Propagation timeline** — chronological table: #, service, onset, delay, confidence, metric-pair evidence
+5. **Evidence panel** — selected service's details:
+   - Metric z-scores table (CPU, memory, latency, error rate)
+   - Metric line charts (baseline vs incident) with anomaly region highlighted
+   - Trace Ochiai score + % of anomalous traces containing the service
+   - Anomaly onset time
+   - For non-root services: causal edge evidence (Pearson/Spearman, lag, metric pair)
+
+### Component 6.3: Postmortem Generator
+
+**Purpose:** Auto-generate structured markdown postmortems from investigation data.
+
+**What to understand when coding this:**
+
+1. Collect all incident data from the pipeline outputs
+2. Map pipeline fields to template sections:
+   - `root_cause` → from Project 2 or 4 ranking
+   - `incident_time` → from user input
+   - `timeline` → from Project 5 propagation path
+   - `affected_services` → all nodes in causal graph
+   - `evidence` → per-service z-scores, Ochiai, onset times
+   - `summary` → auto-generated: "On [date], [root_cause] experienced [issue], causing [N] downstream services to fail over [duration]."
+3. Render via Jinja2 template
+4. Output as downloadable `.md` file via `st.download_button`
+
+**Default template sections:** Summary, Impact (per affected service), Timeline (with evidence column), Root Cause (with detail), Evidence (per service), Resolution (blank + prompt), Lessons Learned (blank + prompt), Action Items (blank table).
+
+**Custom templates:** Accept a `--template custom.md` argument with Jinja2 syntax.
+
+### Component 6.4: CLI and Launch
+
+**Purpose:** Launch the dashboard and configure connections.
+
+```bash
+# Launch with all services connected
+sre-console --prometheus-url http://localhost:9090 \
+            --jaeger-url http://localhost:16686 \
+            --port 8501
+
+# Launch in live-health-only mode (no Jaeger/Pipeline)
+sre-console --prometheus-url http://localhost:9090 --live-only
+
+# Use custom postmortem template
+sre-console --postmortem-template company-standard.md
+
+# Specify pipeline binary paths
+sre-console --topology-map-bin ./topology-map \
+            --microrank-bin ./microrank \
+            --rca-detect-bin ./rca-detect \
+            --causal-trace-bin ./causal-trace
+```
+
+Run with: `streamlit run console.py -- [args]` or via a wrapper script.
+
+## How the Pieces Connect
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    SRE Incident Console                      │
+│                                                              │
+│  ┌─────────────┐  ┌──────────────┐  ┌──────────────────┐   │
+│  │ Live Health  │  │ Incident     │  │ Postmortem       │   │
+│  │ Overview     │  │ Investigator │  │ Generator        │   │
+│  │ (6.1)        │  │ (6.2)        │  │ (6.3)            │   │
+│  └──────┬───────┘  └──────┬───────┘  └────────┬─────────┘   │
+│         │                 │                    │             │
+│         ▼                 ▼                    ▼             │
+│  ┌─────────────┐  ┌──────────────────────────────────────┐  │
+│  │ Prometheus  │  │ Pipeline Orchestrator                 │  │
+│  │ (instant    │  │                                      │  │
+│  │  queries)   │  │ Project 1 → graph + lag windows      │  │
+│  └─────────────┘  │ Project 2 → Ochiai scores            │  │
+│                   │ Project 4 → metric anomalies + fused  │  │
+│                   │ Project 5 → causal graph + timeline   │  │
+│                   └──────────────────────────────────────┘  │
+│                                                              │
+│  All data flows into:                                        │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ Streamlit UI Layer                                    │   │
+│  │ - st.columns (service cards)                         │   │
+│  │ - st.plotly_chart (metric charts)                    │   │
+│  │ - streamlit-agraph (causal graph)                    │   │
+│  │ - st.markdown (postmortem preview)                   │   │
+│  │ - st.download_button (export)                        │   │
+│  └──────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+## Understanding Checkpoints
+
+1. "Can I fetch current metric values from Prometheus and display them in Streamlit?" — If no, check PromQL queries and Streamlit setup.
+2. "Does the health status correctly reflect the z-score thresholds?" — If no, check your threshold logic: healthy (z<2), degraded (2≤z<3), critical (z≥3).
+3. "Does the dashboard auto-refresh without manual intervention?" — If no, check `st.rerun()` + `time.sleep(30)` loop.
+4. "Can I enter an incident timestamp, run the full pipeline, and see the root cause + causal graph?" — If no, check pipeline binary paths and JSON output parsing.
+5. "Does clicking a node in the causal graph update the evidence panel?" — If no, check your click handler and state management.
+6. "Does the generated postmortem include all auto-fillable sections?" — If no, check the template mapping and pipeline output parsing.
+
+## Common Mistakes
+
+1. **Not handling services with no metrics.** Show as "unknown" (grey) rather than crashing.
+2. **Querying Prometheus too frequently.** Auto-refresh every 30 seconds is fine. Every 5 seconds will overload Prometheus.
+3. **Not handling Prometheus/Jaeger downtime.** Show clear error messages rather than crashing.
+4. **Overly complex dashboard.** At 3 AM, the SRE needs root cause + propagation + evidence. Remove everything that doesn't directly answer "what's broken and what do I do about it."
+5. **Generating postmortems with placeholder text.** Auto-fill everything possible from pipeline data. Only leave lessons learned and action items for human input.
+6. **Not making the causal graph interactive.** A static image is useless — the SRE needs to click nodes to drill into evidence.
+
+## Ship Criteria
+
+- [ ] Live health view with all services and color-coded status
+- [ ] Key metrics (CPU, memory, latency, error rate) per service with sparkline charts
+- [ ] Auto-refresh every 30 seconds
+- [ ] Incident investigation mode: enter timestamp → run full pipeline → display results
+- [ ] Interactive causal graph with clickable nodes showing evidence panels
+- [ ] Propagation path timeline with time delays and confidence per step
+- [ ] Multi-factor confidence breakdown (4 dimensions, 0-100 total)
+- [ ] Metric charts with baseline vs incident comparison and anomaly region highlighting
+- [ ] One-click postmortem export as downloadable `.md` file
+- [ ] Customizable Jinja2 postmortem templates
+- [ ] CLI for launch configuration (`--prometheus-url`, `--jaeger-url`, `--port`, etc.)
+- [ ] Summary bar (total / healthy / degraded / critical counts)
+- [ ] Handles Prometheus/Jaeger downtime gracefully
+- [ ] README with screenshots, setup instructions, and production deployment guide
+- [ ] Runs with `streamlit run` or wrapper script

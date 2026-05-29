@@ -1,0 +1,468 @@
+# Project 3: Fault Injection Toolkit — Build Reference
+
+> This document is the canonical reference for building a Kubernetes fault injection CLI tool. It is a standalone, shippable project that contributes to Phase 0 testing, Phase 2 validation, and Phase 5 evaluation of the SRE Root Cause Analysis Tool. Use this as the source of truth when prompting for implementation help. This project is an enhanced version of subproject #1 (Fault Injector CLI).
+
+---
+
+## Meta-Structure: How to Read This Document
+
+This project contains these sections:
+
+- **Real Objective** — What you are *actually* trying to accomplish, stated in plain English.
+- **Tool Objective** — What the software must do at the end. This is the acceptance test.
+- **What You Must Understand Before Coding** — Concepts, their internals, and why they matter.
+- **What to Study and Where** — Specific resources, specific sections, specific things to extract.
+- **What to Code** — Each component, its purpose, inputs, outputs, internals, and verification.
+- **How the Pieces Connect** — Data flow showing how components connect.
+- **Understanding Checkpoints** — Concrete things you should be able to explain before moving on.
+- **Common Mistakes** — What people get wrong and how to avoid it.
+- **Ship Criteria** — What makes this project ready to publish and share.
+
+---
+
+## Real Objective
+
+You are building a tool that deliberately breaks Kubernetes services in controlled, repeatable ways. Think of it like a fire drill system — you need to create realistic failure scenarios so you can test whether your detection tools actually work. Without fault injection, you're building a diagnostic tool with nothing to diagnose. This CLI lets you say "break service X in way Y" and get a predictable failure signature in your traces and metrics.
+
+This project is the foundation of all testing in the SRE RCA pipeline — it powers the Phase 2 test suite (Project 4), the causal validation (Project 5), and the evaluation framework (Project 7). Every other project depends on being able to reliably create and remove faults.
+
+## Tool Objective
+
+By the end of this project, the CLI must:
+1. Accept a target service/pod and a fault type as arguments
+2. Inject the fault into the running Kubernetes cluster
+3. Report the expected failure signature (what the user should see in traces/metrics)
+4. Track all active faults in a local state file
+5. Support at least 6 fault types: network latency, packet loss, CPU stress, memory pressure, pod scaling, and error injection
+6. Have a `cleanup` command that reverses any injected fault
+7. Include preset scenarios that simulate realistic production incidents
+8. Produce machine-readable output (`--format json`) for integration with Projects 4 and 7
+
+## What You Must Understand Before Coding
+
+### Concept 1: Kubernetes Pod Execution
+
+`kubectl exec` lets you run commands inside a running container. This is the foundation of fault injection — you're running commands inside the container that cause it to misbehave.
+
+The syntax: `kubectl exec -n <namespace> <pod-name> -c <container-name> -- <command>`
+
+The `-c` flag specifies which container in the pod (many pods have sidecar containers like `istio-proxy`). The `--` separates kubectl flags from the command to execute inside the container.
+
+**Why this matters:** Every in-pod fault injection command runs via `kubectl exec`. If you target the wrong pod or container, the fault won't apply where you expect, and your test results will be meaningless.
+
+**Self-check:** Given a pod `cartservice-abc123` with containers `server` and `istio-proxy`, how do you run `tc qdisc add dev eth0 root netem delay 500ms` inside the `server` container? Answer: `kubectl exec cartservice-abc123 -c server -- tc qdisc add dev eth0 root netem delay 500ms`
+
+### Concept 2: Traffic Control (tc) for Network Faults
+
+`tc` (traffic control) is a Linux utility that manipulates network traffic at the kernel level. The `netem` module adds artificial network impairments.
+
+Key commands:
+- **Add latency:** `tc qdisc add dev eth0 root netem delay 500ms` — adds 500ms to every packet
+- **Add latency with jitter:** `tc qdisc add dev eth0 root netem delay 500ms 50ms` — 500ms ± 50ms
+- **Add packet loss:** `tc qdisc add dev eth0 root netem loss 10%` — drops 10% of packets
+- **Remove ALL rules:** `tc qdisc del dev eth0 root` — restores normal networking
+
+**Why this matters:** Network latency is the most common production failure mode. Your fault injector must handle adding AND removing these rules cleanly. If cleanup fails, the system stays degraded permanently.
+
+**Expected failure signature:**
+- In Jaeger: span durations from the faulted pod increase by ~the injected amount
+- In Prometheus: HTTP latency metrics spike. Upstream services may see timeouts if their timeout < injected delay
+- In the dependency graph (Project 1): the faulted service gets highlighted as anomalous
+
+**Self-check:** If you add a 500ms delay to cart-service, what happens to traces that include `frontend → cart-service → database`? Answer: The cart-service span goes from, say, 50ms to 550ms. The frontend span duration increases proportionally (it includes the cart-service call). The database span is unaffected (it's downstream). The trace-level total duration increases.
+
+### Concept 3: Stress Testing with stress-ng
+
+`stress-ng` is a Linux stress testing tool that can saturate CPU, memory, disk I/O, and other resources.
+
+Key commands:
+- **CPU stress:** `stress-ng --cpu 4 --timeout 300s` — spawns 4 CPU-bound workers for 5 minutes
+- **Memory stress:** `stress-ng --vm 2 --vm-bytes 512M --timeout 300s` — allocates 512MB per worker
+- **I/O stress:** `stress-ng --io 4 --timeout 300s` — generates disk I/O load
+
+**Why this matters:** Resource exhaustion is a fundamentally different failure signature than network latency. CPU stress causes the service to process requests slower (increased latency due to contention) but doesn't affect network directly. This tests whether your RCA tool can distinguish resource faults from network faults.
+
+**Expected failure signature:**
+- In Prometheus: CPU usage spikes to near 100%. Latency may increase (due to contention). Memory stays normal.
+- In Jaeger: Traces may NOT show clear anomalies — spans might remain within 2× P95 threshold even though the service is stressed (this is why Phase 1 trace-only analysis misses CPU stress — it's a metric-only signal)
+
+**Self-check:** If a container doesn't have `stress-ng` installed, what's your fallback? Answer: Install it via the container's package manager (`apt-get install -y stress-ng`), or use a simpler fallback like `for i in $(seq 4); do while true; do :; done & done` (spawns 4 infinite-loop workers, less controlled but works without installation).
+
+### Concept 4: Kubernetes Scaling for Capacity Faults
+
+`kubectl scale` changes the number of replicas for a deployment. Reducing replicas simulates partial outages.
+
+Key command: `kubectl scale deployment <name> --replicas=1` (reduce from, say, 3 to 1)
+
+**Why this matters:** When you reduce replicas, the remaining pods handle all the traffic. This increases latency, error rates, and resource usage. It simulates a pod crash or node failure — a very realistic production scenario.
+
+**Critical requirement:** You MUST record the original replica count BEFORE scaling. The Kubernetes API doesn't store "what it was before" — that's your responsibility. Store it in the active faults tracker.
+
+**Expected failure signature:**
+- In Prometheus: CPU and memory per-pod increase. Latency increases. Error rate may spike (if the remaining pod can't handle all traffic).
+- In Jaeger: Spans show increased duration. Some traces may show errors.
+- Both trace AND metric signals fire — this fault type is detectable by both Phase 1 and Phase 2.
+
+**Self-check:** If you scale `cartservice` from 3 replicas to 1, what happens to the load balancer? Answer: The Kubernetes Service stops routing traffic to the 2 removed pods. All traffic goes to the remaining 1 pod, which becomes overloaded.
+
+### Concept 5: Expected Failure Signatures (The Map of Fault → Signal)
+
+Each fault type produces a distinct pattern in your observability data. Your tool should report what to look for:
+
+| Fault Type | Trace Signal | Metric Signal | Best Detected By |
+|---|---|---|---|
+| Network latency | Span duration ↑↑ | HTTP latency ↑↑ | Phase 1 (trace) |
+| Packet loss | Spans missing/retried ↑ | Error rate ↑, latency ↑ | Phase 1 + 2 |
+| CPU stress | Span duration ↑ (mild) | CPU usage ↑↑ | Phase 2 (metric) |
+| Memory pressure | Variable (GC pauses) | Memory usage ↑↑, OOM kills | Phase 2 (metric) |
+| Pod scaling | Span duration ↑, errors ↑ | CPU ↑, latency ↑, errors ↑ | Phase 1 + 2 |
+| Error injection | Span error status ↑ | Error rate ↑↑ | Phase 1 + 2 |
+
+**Why this matters:** When you inject a fault and the RCA tool doesn't detect it, you need to know whether the problem is the tool or the fault. The expected signature tells you what SHOULD happen. If the trace signal is expected to be weak (CPU stress), and your trace-only tool (Phase 1) misses it — that's expected behavior, not a bug.
+
+## What to Study and Where
+
+| What | Where | What to Extract |
+|---|---|---|
+| `tc` and `netem` | `man tc`, `man tc-netem`, or [Linux Traffic Control HOWTO](https://tldp.org/HOWTO/Traffic-Control-HOWTO/) | Exact syntax for add/remove delay, loss, and corruption rules. |
+| `stress-ng` | [stress-ng man page](https://manpages.ubuntu.com/manpages/jammy/man1/stress-ng.1.html) | CPU, memory, and I/O stress options. Understand `--timeout` for auto-cleanup. |
+| `kubectl exec` | [kubectl exec docs](https://kubernetes.io/docs/reference/kubectl/generated/kubectl_exec/) | Pod targeting, container selection (`-c`), and command execution. |
+| `kubectl scale` | [kubectl scale docs](https://kubernetes.io/docs/reference/kubectl/generated/kubectl_scale/) | Deployment replica manipulation. Original count must be recorded before scaling. |
+| `kubectl set env` | [kubectl set env docs](https://kubernetes.io/docs/reference/kubectl/generated/kubectl_set_env/) | Environment variable injection for error mode simulation. |
+
+## What to Code
+
+### Component 3.1: Fault Injector Core
+
+**Purpose:** Execute fault injection commands against a Kubernetes cluster and track active faults.
+
+**Input:** Fault type, target pod/deployment, parameters (e.g., latency amount, CPU cores)
+**Output:** Success/failure status, cleanup instructions, expected failure signature
+
+**What to understand when coding this:**
+
+Each fault type maps to specific inject/cleanup commands:
+
+```python
+FAULT_TYPES = {
+    "latency": {
+        "inject": "tc qdisc add dev eth0 root netem delay {amount}ms",
+        "cleanup": "tc qdisc del dev eth0 root",
+        "params": {"amount": 500},
+        "is_kubectl_exec": True,
+        "signature": {
+            "trace_signal": "strong",
+            "metric_signal": "moderate",
+            "expected": "Span durations increase by ~{amount}ms; HTTP latency metrics spike",
+        }
+    },
+    "packet_loss": {
+        "inject": "tc qdisc add dev eth0 root netem loss {percent}%",
+        "cleanup": "tc qdisc del dev eth0 root",
+        "params": {"percent": 10},
+        "is_kubectl_exec": True,
+        "signature": {
+            "trace_signal": "strong",
+            "metric_signal": "moderate",
+            "expected": "Retried spans appear; error rate increases by ~{percent}%",
+        }
+    },
+    "cpu_stress": {
+        "inject": "stress-ng --cpu {cores} --timeout {duration}s",
+        "cleanup": "pkill stress-ng",
+        "params": {"cores": 2, "duration": 300},
+        "is_kubectl_exec": True,
+        "signature": {
+            "trace_signal": "weak",
+            "metric_signal": "strong",
+            "expected": "CPU usage approaches {cores}00%; latency may increase mildly. Trace-only tools may miss this fault.",
+        }
+    },
+    "memory_stress": {
+        "inject": "stress-ng --vm 2 --vm-bytes {mb}M --timeout {duration}s",
+        "cleanup": "pkill stress-ng",
+        "params": {"mb": 512, "duration": 300},
+        "is_kubectl_exec": True,
+        "signature": {
+            "trace_signal": "variable",
+            "metric_signal": "strong",
+            "expected": "Memory usage increases by ~{mb}MB per worker; possible GC pauses affect latency intermittently.",
+        }
+    },
+    "scale_down": {
+        "inject": "kubectl scale deployment {deployment} --replicas=1",
+        "cleanup": "kubectl scale deployment {deployment} --replicas={original}",
+        "params": {},
+        "is_kubectl_exec": False,
+        "requires_original_state": True,
+        "signature": {
+            "trace_signal": "strong",
+            "metric_signal": "strong",
+            "expected": "All traffic hits 1 pod. Latency increases, CPU per pod increases, error rate may spike.",
+        }
+    },
+    "error_injection": {
+        "inject": "kubectl set env deployment/{deployment} FAULT_MODE=true",
+        "cleanup": "kubectl set env deployment/{deployment} FAULT_MODE-",
+        "params": {},
+        "is_kubectl_exec": False,
+        "signature": {
+            "trace_signal": "strong",
+            "metric_signal": "strong",
+            "expected": "Error spans appear in traces; 5xx error rate in metrics increases. Requires the service to actually use FAULT_MODE env var.",
+        }
+    },
+}
+```
+
+**Edge cases:**
+- The target pod might not have `tc` or `stress-ng` installed. Check with `which tc` and `which stress-ng` first. Install if needed (`apt-get install -y iproute2 stress-ng`).
+- The fault might already be active (idempotency). Check before injecting. If latency is already active, `list` should show it.
+- `kubectl exec` might fail due to network issues, pod restarts, or permission errors. Handle timeouts and retries.
+
+**How to verify it works:**
+1. Inject latency into `cart-service`. Check Jaeger → spans show ~500ms increased duration.
+2. Inject CPU stress. Check Prometheus → CPU metric spikes above 3σ.
+3. Run `fault-inject list` → shows the active fault with its timestamp and cleanup command.
+4. Run cleanup. System returns to normal within 2 minutes.
+
+### Component 3.2: Active Fault Tracker
+
+**Purpose:** Track all active faults in a local state file for `list` and `cleanup` commands.
+
+**Input:** Fault injection records
+**Output:** Reads/writes `~/.fault-injector/active_faults.json`
+
+**What to understand when coding this:**
+
+```python
+@dataclass
+class ActiveFault:
+    id: str                    # unique ID (uuid4)
+    fault_type: str
+    target: str                # pod name or deployment name
+    namespace: str
+    inject_command: str
+    cleanup_command: str
+    params: dict
+    injected_at: datetime
+    expected_signature: str    # human-readable description
+    original_state: dict | None  # e.g., {"replicas": 3} for scale_down
+
+class FaultTracker:
+    STATE_FILE = Path.home() / ".fault-injector" / "active_faults.json"
+
+    def add(self, fault: ActiveFault):
+        faults = self._load()
+        faults[fault.id] = fault
+        self._save(faults)
+
+    def get_all(self) -> list[ActiveFault]:
+        return list(self._load().values())
+
+    def get(self, fault_id: str) -> ActiveFault | None:
+        return self._load().get(fault_id)
+
+    def remove(self, fault_id: str):
+        faults = self._load()
+        faults.pop(fault_id, None)
+        self._save(faults)
+
+    def clear_all(self):
+        self._save({})
+
+    def _load(self) -> dict:
+        if not self.STATE_FILE.exists():
+            return {}
+        with open(self.STATE_FILE) as f:
+            return json.load(f)
+
+    def _save(self, faults: dict):
+        self.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.STATE_FILE, "w") as f:
+            json.dump(faults, f, indent=2, default=str)
+```
+
+**Why this matters:** Without persistent tracking, the `list` and `cleanup` commands can't know what's active. If you inject a fault and the CLI crashes, you need to be able to query and clean up the fault later.
+
+### Component 3.3: CLI Interface
+
+**Purpose:** Provide a clean command-line interface for fault injection.
+
+**Commands:**
+```bash
+# Inject a fault
+fault-inject inject --type latency --service cartservice --amount 500
+
+# Inject CPU stress on a specific pod
+fault-inject inject --type cpu_stress --pod cartservice-abc123 --cores 2 --duration 300
+
+# Scale down a deployment
+fault-inject inject --type scale_down --deployment cartservice
+
+# Inject a preset scenario
+fault-inject scenario black-friday
+
+# List active faults
+fault-inject list
+
+# List active faults in JSON (for Project 7 automation)
+fault-inject list --output json
+
+# Clean up a specific fault
+fault-inject cleanup --fault-id abc-123
+
+# Clean up all faults
+fault-inject cleanup --all
+
+# Show expected failure signature for a fault type
+fault-inject info --type cpu_stress
+```
+
+Use `click` for CLI parsing. Structure subcommands with `@click.group()`.
+
+### Component 3.4: Preset Scenarios
+
+**Purpose:** Pre-defined multi-step fault scenarios that simulate realistic production incidents.
+
+**Scenarios:**
+
+1. **`black-friday`**: Database connection pool exhaustion.
+   - Inject CPU + memory stress on database pod
+   - Expected: database metrics (CPU, memory, connection pool) spike. All services calling DB show increased latency.
+   - Tests: Can the RCA tool identify DB as root cause when 8+ services all look broken?
+
+2. **`network-degradation`**: 300ms latency on all inter-service communication.
+   - Inject latency on cart-service AND payment-service simultaneously
+   - Expected: Multiple services show trace anomalies. Multiple services rank high in spectrum scores.
+   - Tests: Can the RCA tool handle simultaneous failures?
+
+3. **`partial-outage`**: Scale down one service to 1 replica.
+   - Scale cartservice deployment to 1 replica (from 3)
+   - Expected: Trace latency increases, error rate increases, CPU per pod increases
+
+4. **`cascading-failure`**: Inject latency on database, observe cascade.
+   - Inject 500ms latency on database pod
+   - Expected: DB latency spikes → payment-service timeouts → cart-service errors → frontend 5xx
+   - Tests: The causal graph (Project 5) should trace the full cascade
+
+5. **`bad-deploy`**: Set error injection env var on one service.
+   - Set `FAULT_MODE=true` on recommendation-service
+   - Expected: Error rate spikes on that service. Traces show error spans.
+   - Tests: Phase 1 should rank this service #1 (it's the only one with errors)
+
+6. **`memory-leak`**: Gradual memory consumption over 15 minutes.
+   - Inject memory stress with increasing allocation
+   - Expected: Memory usage grows linearly. PELT (Project 5) should detect onset at start, not at threshold crossing.
+   - Tests: Temporal onset detection accuracy (PELT vs z-score)
+
+**What to understand when coding scenario runner:**
+
+Each scenario is a sequence of fault injections with optional timing:
+```python
+SCENARIOS = {
+    "cascading-failure": [
+        {"type": "latency", "target": "database", "params": {"amount": 500}, "wait_seconds": 300},
+    ],
+    "network-degradation": [
+        {"type": "latency", "target": "cartservice", "params": {"amount": 300}},
+        {"type": "latency", "target": "paymentservice", "params": {"amount": 300}},
+        {"wait_seconds": 300},
+    ],
+}
+```
+
+The scenario runner should:
+1. Record the scenario start time
+2. Execute each fault injection in sequence
+3. Report the expected failure signature for the whole scenario
+4. Provide a single `fault-inject cleanup --all` command for the entire scenario
+
+### Component 3.5: Machine-Readable Output
+
+**Purpose:** Produce JSON output for automated consumption by Projects 4 and 7.
+
+**What to understand when coding this:**
+
+The `--output json` flag on `inject` and `list` commands should produce structured data:
+```json
+{
+  "status": "injected",
+  "fault_id": "abc-123",
+  "fault_type": "latency",
+  "target": "cartservice-abc123",
+  "injected_at": "2026-05-26T02:14:00Z",
+  "expected_signature": {
+    "trace_signal": "strong",
+    "metric_signal": "moderate",
+    "description": "Span durations increase by ~500ms; HTTP latency metrics spike"
+  },
+  "cleanup_command": "fault-inject cleanup --fault-id abc-123"
+}
+```
+
+This allows Project 7 (Benchmark Suite) to programmatically inject faults and know exactly what to expect.
+
+## How the Pieces Connect
+
+```
+User CLI Command
+       │
+       ▼
+┌─────────────────┐
+│  CLI Interface   │ ←── Parses command, validates args
+│  (Component 3.3) │
+└────────┬────────┘
+         │
+    ┌────┴────────────────┐
+    ▼                     ▼
+┌─────────────────┐  ┌──────────────────┐
+│ Fault Injector   │  │ Preset Scenarios │
+│ Core             │  │ (Component 3.4)  │
+│ (Component 3.1)  │  │ Multi-step       │
+│ Executes single  │  │ sequences        │
+│ fault via kubectl│  └──────────────────┘
+└────────┬────────┘
+         │
+    ┌────┴────────────┐
+    ▼                 ▼
+┌────────────┐  ┌──────────────────┐
+│ Active     │  │ Machine-Readable │
+│ Fault      │  │ Output           │
+│ Tracker    │  │ (Component 3.5)  │
+│ (3.2)      │  │ JSON for Project │
+│ State file │  │ 4, 5, 7          │
+└────────────┘  └──────────────────┘
+```
+
+## Understanding Checkpoints
+
+1. "Can I inject latency into a specific pod and verify it shows up in Jaeger?" — If no, your kubectl exec targeting is wrong (wrong pod, wrong container, or `tc` not installed).
+2. "Can I clean up a fault and verify the system returns to normal?" — If no, your cleanup commands are incomplete or the fault tracker is out of sync.
+3. "Can I run a preset scenario and see all the expected failure signatures?" — If no, the scenario's fault parameters need tuning for your specific cluster.
+4. "Can I explain why CPU stress has a weak trace signal but a strong metric signal?" — Answer: CPU stress causes contention (slightly higher latency) but may not exceed the 2× P95 threshold. The main signal is in the CPU usage metric, not in spans. Trace-only tools (Phase 1) will miss this fault.
+5. "Can I produce JSON output consumable by Project 7's benchmark runner?" — If no, re-read Component 3.5.
+
+## Common Mistakes
+
+1. **Not storing original state before scaling.** If you scale down from 3 to 1 but don't record that it was 3, cleanup can't restore the correct replica count. The deployment stays degraded.
+2. **Assuming all containers have `tc` and `stress-ng`.** Minimal container images (like distroless or scratch) don't include these. Check first with `which`. Install if missing. Have a fallback (infinite-loop processes for CPU stress).
+3. **Not handling concurrent faults on the same pod.** If you inject latency and then CPU stress on the same pod, cleanup must remove both independently. Track each fault with a unique ID in the state file.
+4. **Not verifying fault injection succeeded.** `kubectl exec` can fail silently (exit code 0 but command didn't run). Always verify: `tc qdisc show dev eth0` should show the netem rule. `pgrep stress-ng` should return PIDs.
+5. **Cleaning up with `tc qdisc del dev eth0 root` when no netem rules exist.** This removes default qdiscs and can break networking entirely. Check first: `tc qdisc show dev eth0 | grep netem`. Only delete if netem is present.
+6. **Forgetting namespace.** If the target is in a non-default namespace, all `kubectl` commands need `-n <namespace>`.
+
+## Ship Criteria
+
+- [ ] CLI with `inject`, `list`, `cleanup`, `scenario`, and `info` commands
+- [ ] 6+ fault types supported: latency, packet loss, CPU stress, memory stress, scale down, error injection
+- [ ] 6 preset scenarios: black-friday, network-degradation, partial-outage, cascading-failure, bad-deploy, memory-leak
+- [ ] Active fault tracking in `~/.fault-injector/active_faults.json`
+- [ ] Expected failure signatures reported per fault type and per scenario
+- [ ] Machine-readable JSON output (`--output json`) for automation
+- [ ] Clean help text with usage examples
+- [ ] README with installation, fault type reference, scenario descriptions, and expected signatures table
+- [ ] Can be installed via `pip install` or run directly from the repo
+- [ ] Works against any Kubernetes cluster with Online Boutique deployed
+- [ ] Idempotent: checking if fault already active before injecting
+- [ ] Cleanup verification: confirms fault is actually removed after cleanup

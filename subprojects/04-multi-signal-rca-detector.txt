@@ -1,0 +1,561 @@
+# Project 4: Multi-Signal RCA Detector — Build Reference
+
+> This document is the canonical reference for building a multi-signal root cause analysis detector that fuses trace-based and metric-based anomaly signals. It is a standalone, shippable project that contributes to Phase 2 of the SRE Root Cause Analysis Tool. Use this as the source of truth when prompting for implementation help. This project is an enhanced version of subproject #3 (Prometheus Anomaly Detector) and integrates with Project 2 (MicroRank Engine).
+
+---
+
+## Meta-Structure: How to Read This Document
+
+This project contains these sections:
+
+- **Real Objective** — What you are *actually* trying to accomplish, stated in plain English.
+- **Tool Objective** — What the software must do at the end. This is the acceptance test.
+- **What You Must Understand Before Coding** — Concepts, their internals, and why they matter.
+- **What to Study and Where** — Specific resources, specific sections, specific things to extract.
+- **What to Code** — Each component, its purpose, inputs, outputs, internals, and verification.
+- **How the Pieces Connect** — Data flow showing how components connect.
+- **Understanding Checkpoints** — Concrete things you should be able to explain before moving on.
+- **Common Mistakes** — What people get wrong and how to avoid it.
+- **Ship Criteria** — What makes this project ready to publish and share.
+
+---
+
+## Real Objective
+
+You are building a tool that queries Prometheus for service metrics and detects anomalies, then fuses those metric signals with the trace-based spectrum scores from Project 2 to produce a more accurate root cause ranking. Think of it like giving your detective a second type of evidence. In Phase 1 (Project 2), the detective only had witness statements (traces). Now the detective also gets medical records (metrics): CPU at 99%, memory leaking, connection pool exhausted. A service can look fine in traces but be sick in metrics.
+
+The real-world impact: Phase 1 (trace-only) can detect latency injection and error spikes. Phase 2 can additionally detect CPU exhaustion, memory leaks, disk saturation, and connection pool exhaustion — all metric-only signals that Phase 1 would miss. The fusion also reduces false positives: a service with high trace anomaly but normal metrics is probably a victim, not the root cause.
+
+## Tool Objective
+
+By the end of this project, the tool must:
+1. Query Prometheus for 4 key metrics per service (CPU, memory, latency, error rate) using correct PromQL patterns
+2. Compute baseline statistics from a historical sliding window
+3. Detect anomalies using z-scores (and optionally MAD for robustness)
+4. Optionally detect anomaly onsets using PELT changepoint detection
+5. Fuse trace-based spectrum scores (from Project 2) with metric anomaly scores into a unified personalization vector
+6. Run Personalized PageRank with the fused personalization to produce a final root cause ranking
+7. Report which services are anomalous and why (trace evidence + metric evidence)
+8. Support configurable thresholds, time windows, and fusion weights
+9. Provide both a programmatic API (Python library) and a CLI
+
+## What You Must Understand Before Coding
+
+### Concept 1: Z-Score Anomaly Detection on Time Series
+
+A z-score measures how many standard deviations a data point is from the mean:
+
+$$z = \frac{x - \mu}{\sigma}$$
+
+Where `x` is the current value, `μ` is the baseline mean, and `σ` is the baseline standard deviation.
+
+**Interpretation:**
+- `|z| > 2`: unusual (5% chance under normal distribution) — mild anomaly
+- `|z| > 3`: very unusual (0.3% chance) — strong anomaly
+- `|z| > 5`: critical anomaly (essentially impossible under normal distribution)
+
+**Why z-scores beat fixed thresholds:** CPU at 80% might be normal during peak traffic but anomalous at 3 AM. Z-scores are relative to each service's own baseline, so they automatically adapt.
+
+**Self-check:** A service's CPU usage baseline is μ = 45%, σ = 8%. During an incident, CPU is at 78%. What's the z-score? Is it anomalous? Answer: z = (78 - 45) / 8 = 4.125. Yes, strongly anomalous (> 3).
+
+**Common mistake:** Computing z-scores using the current window's own mean and standard deviation instead of the baseline's. If the anomaly is already happening, the current mean will be skewed high, making the z-score look normal. ALWAYS use baseline statistics.
+
+### Concept 2: Metric Types and PromQL Patterns
+
+You need four PromQL queries per service. Each metric TYPE requires a different PromQL approach:
+
+**1. CPU Usage (Counter → rate)**
+```promql
+100 * rate(container_cpu_usage_seconds_total{container!="POD", namespace="default"}[5m])
+```
+CPU is a COUNTER (cumulative, only goes up since process start). You MUST use `rate()` — raw counter values are meaningless. The `[5m]` window smooths short fluctuations.
+
+**2. Memory Usage (Gauge → direct)**
+```promql
+container_memory_working_set_bytes{container!="POD", namespace="default"}
+```
+Memory is a GAUGE (current value, can go up or down). You can read it directly — no `rate()` needed.
+
+**3. P95 Latency (Histogram → percentile)**
+```promql
+histogram_quantile(0.95,
+  sum(rate(http_server_request_duration_seconds_bucket{namespace="default"}[5m]))
+    by (le, service)
+)
+```
+Latency is a HISTOGRAM (observations bucketed by latency ranges). You MUST use `histogram_quantile()` with the `le` label. The `sum() by (le, service)` ensures correct aggregation across instances.
+
+**4. Error Rate (Counter → ratio of rates)**
+```promql
+100 * sum(rate(http_server_requests_total{status=~"5..", namespace="default"}[5m])) by (service)
+  / sum(rate(http_server_requests_total{namespace="default"}[5m])) by (service)
+```
+Error rate is a ratio of two counters. Both numerator AND denominator must use `rate()`. Never divide raw counters — they reset on restart.
+
+**Self-check:** Why does CPU use `rate()` but memory doesn't? Answer: CPU is a counter (cumulative, monotonic), memory is a gauge (instantaneous value). Why divide `rate(errors)` by `rate(total)` instead of raw `errors / total`? Because counters reset on restart — raw values can go from 5 billion to 0, making ratios meaningless.
+
+### Concept 3: MAD (Median Absolute Deviation) for Robustness
+
+When baseline data has outliers or the standard deviation is 0, use MAD instead:
+
+$$\text{MAD} = \text{median}(|x_i - \text{median}(x)|)$$
+$$z_{\text{robust}} = \frac{x - \text{median}(x)}{1.4826 \cdot \text{MAD}}$$
+
+The 1.4826 factor makes MAD comparable to σ for normally distributed data. Use MAD when your baseline metric never changed (σ = 0 — common for error counters) or has wild outliers.
+
+**Self-check:** When should you prefer MAD over standard deviation? Answer: When the baseline has outliers (a one-time spike that was manually cleaned up), or when σ = 0 (metric never changed during baseline — common for counters that are always 0 during normal operation).
+
+### Concept 4: Multi-Modal Score Fusion
+
+You now have two anomaly signals per service:
+- **Trace score** (Ochiai, from Project 2): 0–1, measuring "how associated is this service with anomalous traces?"
+- **Metric score** (max z-score, from this project): unbounded, measuring "how anomalous are this service's metrics?"
+
+The fusion formula:
+$$\text{fused}(s) = \alpha \cdot \text{trace\_score}(s) + \beta \cdot \text{metric\_score\_normalized}(s) + \gamma \cdot \text{graph\_centrality}(s)$$
+
+Where α + β + γ = 1. Start with α = 0.4, β = 0.4, γ = 0.2.
+
+**Normalizing metric z-scores to 0–1:**
+$$\text{metric\_score\_normalized}(s) = \min\left(\frac{\max\_z(s)}{5.0}, 1.0\right)$$
+A z-score of 5.0 maps to 1.0 (maximum anomaly). Adjust the divisor (5.0) based on your data.
+
+**Why fusion helps:** A service with high trace Ochiai (0.9) but low metric z-scores (< 1) is probably a victim — its traces are anomalous because an upstream service failed, but its own resources are fine. The metric signal acts as a "confirming witness." Low metric scores should reduce confidence in the trace-only ranking.
+
+**How graph centrality fits in:** `nx.pagerank(G)` with uniform personalization. This captures "how many other services depend on this one." A service with many dependents is a more impactful root cause location.
+
+**Self-check:** If a service has Ochiai = 0.9, max z-score = 1.2, and graph centrality = 0.15, what's the fused score with α=0.4, β=0.4, γ=0.2? Answer: fused = 0.4×0.9 + 0.4×(1.2/5.0) + 0.2×0.15 = 0.36 + 0.096 + 0.03 = 0.486. Moderate — the trace signal is high but metrics disagree.
+
+### Concept 5: PELT Changepoint Detection (Onset Detection)
+
+Z-scores flag anomalies when individual points cross a threshold. PELT (Pruned Exact Linear Time) finds the moment the entire distribution shifts — the mean, variance, or both change. This is more accurate for finding "when did the problem start."
+
+```python
+import ruptures as rpt
+
+def detect_onset(metric_series: np.ndarray,
+                 baseline_window: int = 60) -> int | None:
+    algo = rpt.Pelt(model="l2", min_size=3).fit(metric_series)
+    change_points = algo.predict(pen=10)
+    for cp in change_points:
+        if cp > baseline_window:
+            return cp
+    return None
+```
+
+**Why PELT for onset detection:** A memory leak starts at 02:12 and grows linearly for 20 minutes. Z-score thresholding might not trigger until 02:18 (when it crosses 3σ). PELT detects the shift at ~02:13 because the mean of the post-onset segment differs from the pre-onset segment. For causal analysis (Project 5), onset times accurate to ±1 minute are critical.
+
+**Self-check:** Which method gives a more accurate onset time for a gradual memory leak — PELT or z-score thresholding? Answer: PELT. Z-scores detect threshold crossings; PELT detects distribution shifts. For gradual anomalies, the distribution shifts long before any value crosses a magic threshold.
+
+## What to Study and Where
+
+| What | Where | What to Extract |
+|---|---|---|
+| Prometheus HTTP API | [Prometheus API docs](https://prometheus.io/docs/prometheus/latest/querying/api/) | `GET /api/v1/query_range`: parameters (`query`, `start`, `end`, `step`), response format. `start`/`end` are Unix timestamps in SECONDS. |
+| PromQL fundamentals | [Prometheus querying docs](https://prometheus.io/docs/prometheus/latest/querying/basics/) | Counter vs gauge vs histogram. `rate()`, `histogram_quantile()`, `by()` grouping. |
+| Z-score and MAD | Any introductory statistics resource | Z-score formula, MAD formula, when to prefer each. |
+| PELT changepoint detection | [ruptures docs](https://centre-borelli.github.io/ruptures-docs/) | `rpt.Pelt(model="l2")`, `.fit()`, `.predict(pen=10)`. Understand `pen` parameter tuning. |
+| MicroRank Engine (Project 2) | `subprojects/02-microrank-engine.txt` | `SpectrumScorer` API and `RootCauseRanker.rank_pagerank()` — you'll call these for the fused ranking. |
+| Service Topology Mapper (Project 1) | `subprojects/01-service-topology-mapper.txt` | Dependency graph JSON format — you'll consume this. |
+
+## What to Code
+
+### Component 4.1: Prometheus Query Client
+
+**Purpose:** Query Prometheus for metric time series data.
+
+**Input:** PromQL query, time range (start/end Unix timestamps), step interval
+**Output:** Time series as list of `(datetime, float)` tuples per service
+
+**What to understand when coding this:**
+
+The Prometheus API endpoint:
+`GET http://<prometheus-url>/api/v1/query_range?query=<promql>&start=<start>&end=<end>&step=<step>`
+
+- `start` and `end`: Unix timestamps in **seconds** (not microseconds — different from Jaeger!)
+- `step`: data point interval (e.g., `60s` for one point per minute)
+- Response format:
+```json
+{
+  "data": {
+    "result": [
+      {
+        "metric": {"service": "cart-service", "pod": "cartservice-abc123"},
+        "values": [[1609459200, "45.2"], [1609459260, "47.1"]]
+      }
+    ]
+  }
+}
+```
+
+Each entry in `values` is `[unix_timestamp, string_value]`. Parse the string value to float. If the result has multiple series (e.g., one per pod), average them for a service-level view.
+
+```python
+@dataclass
+class MetricSeries:
+    metric_name: str
+    service_name: str
+    timestamps: list[datetime]
+    values: list[float]
+
+class PrometheusClient:
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+
+    def query_range(self, query: str, start: datetime, end: datetime,
+                    step: str = "60s") -> dict[str, MetricSeries]:
+        params = {
+            "query": query,
+            "start": int(start.timestamp()),
+            "end": int(end.timestamp()),
+            "step": step,
+        }
+        resp = requests.get(f"{self.base_url}/api/v1/query_range", params=params)
+        data = resp.json()
+        results = {}
+        for item in data["data"]["result"]:
+            service = item["metric"].get("service", item["metric"].get("pod", "unknown"))
+            timestamps = [datetime.fromtimestamp(ts) for ts, _ in item["values"]]
+            values = [float(v) for _, v in item["values"]]
+            results[service] = MetricSeries(
+                metric_name=query, service_name=service,
+                timestamps=timestamps, values=values
+            )
+        return results
+```
+
+**How to verify it works:**
+- Query `up` (built-in target health metric). Should return 1 for healthy targets.
+- Query `rate(http_server_requests_total[5m])` for a known service. Should return non-zero time series data.
+
+### Component 4.2: Baseline Calculator
+
+**Purpose:** Compute baseline statistics from a historical time window.
+
+**Input:** Time series data from baseline window
+**Output:** Per-service, per-metric baseline statistics (mean, std, MAD)
+
+**What to understand when coding this:**
+
+```python
+from dataclasses import dataclass
+import numpy as np
+
+@dataclass
+class MetricBaseline:
+    metric_name: str
+    mean: float
+    std: float
+    mad: float
+    robust_std: float    # 1.4826 * MAD
+    sample_count: int
+
+def compute_baseline(series: MetricSeries) -> MetricBaseline:
+    values = np.array(series.values)
+    mean = float(np.mean(values))
+    std = float(np.std(values))
+    mad = float(np.median(np.abs(values - np.median(values))))
+    robust_std = 1.4826 * mad if mad > 0 else 0.001
+
+    return MetricBaseline(
+        metric_name=series.metric_name,
+        mean=mean, std=std, mad=mad,
+        robust_std=robust_std, sample_count=len(values)
+    )
+```
+
+**Important:**
+- If `std == 0` (metric never changed during baseline — common for error counters), use `robust_std` as fallback instead of 0 to avoid division by zero
+- If `sample_count < 10`, flag the baseline as "insufficient data" — z-scores are unreliable with too few samples
+- The baseline window must come from the period immediately before the incident (sliding window), not a fixed historical window
+
+**How to verify it works:**
+- Compute baseline for a service running normally. Mean and std should be reasonable (CPU ~30-60%, std ~5-15%).
+- Compute baseline for a service with no data. Should return `None` or raise a clear error.
+
+### Component 4.3: Metric Anomaly Detector
+
+**Purpose:** Compare current metrics against baseline and flag anomalies with z-scores.
+
+**Input:** Baseline statistics per service, current time series per service
+**Output:** Per-service anomaly report with z-scores and onset times (optional)
+
+**What to understand when coding this:**
+
+```python
+@dataclass
+class MetricAnomaly:
+    metric_name: str
+    z_score: float
+    is_anomalous: bool
+    current_value: float
+    baseline_mean: float
+    onset_time: datetime | None
+
+@dataclass
+class ServiceAnomalyReport:
+    service_name: str
+    metrics: dict[str, MetricAnomaly]  # keyed by metric name
+    max_z_score: float
+    overall_anomaly_score: float       # normalized to 0–1
+
+def detect_anomalies(baselines: dict[str, dict[str, MetricBaseline]],
+                     current: dict[str, dict[str, MetricSeries]],
+                     threshold: float = 3.0,
+                     detect_onset: bool = False) -> dict[str, ServiceAnomalyReport]:
+    reports = {}
+    for service, current_metrics in current.items():
+        metric_results = {}
+        for metric_name, series in current_metrics.items():
+            baseline = baselines.get(service, {}).get(metric_name)
+            if baseline is None:
+                continue
+
+            current_mean = np.mean(series.values)
+            effective_std = baseline.std if baseline.std > 0 else baseline.robust_std
+            z = abs(current_mean - baseline.mean) / effective_std
+
+            onset = None
+            if detect_onset and z > threshold:
+                full_values = np.array(series.values)
+                onset_idx = detect_changepoint(full_values, baseline_window=len(full_values) // 2)
+                if onset_idx is not None:
+                    onset = series.timestamps[onset_idx]
+
+            metric_results[metric_name] = MetricAnomaly(
+                metric_name=metric_name,
+                z_score=z,
+                is_anomalous=(z > threshold),
+                current_value=float(current_mean),
+                baseline_mean=baseline.mean,
+                onset_time=onset
+            )
+
+        max_z = max((m.z_score for m in metric_results.values()), default=0.0)
+        reports[service] = ServiceAnomalyReport(
+            service_name=service,
+            metrics=metric_results,
+            max_z_score=max_z,
+            overall_anomaly_score=min(max_z / 5.0, 1.0)  # normalize to 0–1
+        )
+    return reports
+```
+
+**How to verify it works:**
+- Run on normal data → all z-scores < 2, all `is_anomalous` = False
+- Inject CPU stress → CPU z-score for the affected service exceeds 3, `is_anomalous` = True
+- Inject network latency → latency z-score exceeds 3, but CPU and memory remain normal
+- With `--detect-onset` → onset time should be within ±2 minutes of the actual injection time
+
+### Component 4.4: Fused Scorer + Ranker
+
+**Purpose:** Combine trace scores (Project 2) with metric scores (this project) and graph centrality into a fused ranking.
+
+**Input:** Trace Ochiai scores (from Project 2), metric anomaly reports (from Component 4.3), dependency graph (from Project 1)
+**Output:** Ranked list of `(service, fused_score)` with evidence per service
+
+**What to understand when coding this:**
+
+```python
+from microrank import RootCauseRanker  # Project 2
+
+def fuse_and_rank(graph: nx.DiGraph,
+                  trace_scores: dict[str, float],
+                  metric_reports: dict[str, ServiceAnomalyReport],
+                  alpha: float = 0.4,
+                  beta: float = 0.4,
+                  gamma: float = 0.2) -> list[tuple[str, float, dict]]:
+
+    # 1. Compute graph centrality (uniform PageRank)
+    centrality = nx.pagerank(graph, alpha=0.85, weight='weight')
+
+    # 2. Build fused personalization vector
+    fused_scores = {}
+    for node in graph.nodes():
+        ts = trace_scores.get(node, 0.0)                              # 0–1
+        ms = metric_reports.get(node, ServiceAnomalyReport(node, {}, 0, 0)).overall_anomaly_score  # 0–1
+        gc = centrality.get(node, 0.0)                                # 0–1
+
+        fused_scores[node] = alpha * ts + beta * ms + gamma * gc
+
+    # 3. Normalize to sum to 1
+    total = sum(fused_scores.values())
+    personalization = {n: s / total for n, s in fused_scores.items()} if total > 0 else None
+
+    # 4. Run Personalized PageRank with fused personalization
+    ranker = RootCauseRanker()
+    if personalization:
+        ranked = ranker.rank_pagerank(graph, dict(personalization), alpha=0.85)
+    else:
+        ranked = ranker.rank_standard_pagerank(graph)
+
+    # 5. Attach evidence to each result
+    results = []
+    for service, pr_score in ranked:
+        evidence = {
+            "trace_ochiai": trace_scores.get(service, 0.0),
+            "metric_max_z": metric_reports.get(service, ServiceAnomalyReport(service, {}, 0, 0)).max_z_score,
+            "metric_details": {
+                name: {"z": ma.z_score, "anomalous": ma.is_anomalous}
+                for name, ma in metric_reports.get(service, ServiceAnomalyReport(service, {}, 0, 0)).metrics.items()
+            },
+            "graph_centrality": centrality.get(service, 0.0),
+            "fused_raw": fused_scores[service],
+        }
+        results.append((service, pr_score, evidence))
+
+    return results
+```
+
+**Why this differs from Project 2:** In Project 2, the personalization vector was solely Ochiai scores. Here it's a weighted combination of trace + metric + graph signals. This means a service with moderate trace anomaly but STRONG metric anomaly can outrank a service with only trace anomaly — exactly what happens with CPU stress faults.
+
+**How to verify it works:**
+- Run on normal data → fused scores near 0, no clear #1
+- Inject CPU stress → the stressed service should rank #1 (metric signal drives it; Project 2 alone would miss it)
+- Inject network latency → the faulted service should rank #1 (trace signal drives it, same as Project 2)
+- Inject DB stress → DB should rank above all services that call it (graph centrality + metric signal beat trace-only which shows all services as suspicious)
+
+### Component 4.5: CLI and Library API
+
+**Purpose:** Provide both a CLI and a Python library interface.
+
+**CLI commands:**
+```bash
+# Full multi-signal RCA analysis
+rca-detect analyze --incident-time "2026-05-26 02:14:00" \
+    --baseline-window 60 --incident-window 15 \
+    --prometheus-url http://localhost:9090 \
+    --graph graph.json
+
+# With custom fusion weights
+rca-detect analyze --incident-time "..." --alpha 0.5 --beta 0.3 --gamma 0.2
+
+# With PELT onset detection
+rca-detect analyze --incident-time "..." --detect-onset
+
+# Metrics-only mode (no trace fusion, just metric anomaly detection)
+rca-detect metrics --prometheus-url http://localhost:9090 \
+    --baseline-window 60 --incident-window 15
+
+# Output as JSON (for Project 6 dashboard and Project 7 benchmark)
+rca-detect analyze --incident-time "..." --output json --output-file results.json
+
+# List services by anomaly severity
+rca-detect list --prometheus-url http://localhost:9090
+```
+
+**Library API:**
+```python
+from rca_detector import RCAEngine
+
+engine = RCAEngine(prometheus_url="http://localhost:9090")
+
+# Full multi-signal analysis
+results = engine.analyze(
+    incident_time=datetime(2026, 5, 26, 2, 14, 0),
+    baseline_window_minutes=60,
+    incident_window_minutes=15,
+    graph=my_graph,                # from Project 1
+    trace_scores=my_ochiai_scores, # from Project 2
+    alpha=0.4, beta=0.4, gamma=0.2,
+    detect_onset=True
+)
+
+# Metrics-only anomaly detection
+anomalies = engine.detect_metric_anomalies(
+    baseline_window_minutes=60,
+    incident_window_minutes=15,
+    threshold=3.0
+)
+
+# Access results
+for service, pr_score, evidence in results:
+    print(f"{service}: {pr_score:.4f}")
+    print(f"  Trace Ochiai: {evidence['trace_ochiai']:.3f}")
+    print(f"  Metric Max Z: {evidence['metric_max_z']:.1f}")
+```
+
+## How the Pieces Connect
+
+```
+Prometheus API                      Jaeger (via Project 1)
+      │                                      │
+      ▼                                      ▼
+┌─────────────────┐                  ┌──────────────────┐
+│ Prometheus Query │                  │ Dependency Graph │
+│ Client (4.1)     │                  │ (Project 1 JSON) │
+└────────┬────────┘                  └────────┬─────────┘
+         │                                    │
+    ┌────┴────┐                               │
+    ▼         ▼                               │
+┌──────────┐ ┌──────────────┐                 │
+│ Baseline  │ │ Current      │                 │
+│ Calculator│ │ Time Series  │                 │
+│ (4.2)    │ │              │                 │
+└─────┬────┘ └──────┬───────┘                 │
+      │              │                         │
+      └──────┬───────┘                         │
+             ▼                                 │
+┌───────────────────────┐                      │
+│ Metric Anomaly Detector│                     │
+│ (4.3)                 │                     │
+│ z-scores + PELT onset │                     │
+└───────────┬───────────┘                      │
+            │                                  │
+            ▼                                  ▼
+┌─────────────────────────────────────────────────┐
+│ Fused Scorer (4.4)                              │
+│                                                 │
+│ fused = α·trace + β·metric + γ·graph_centrality│
+│                 │                               │
+│   Project 2 ────┤  (trace Ochiai scores)        │
+│   Component 4.3─┤  (metric anomaly scores)      │
+│   Project 1 ────┘  (dependency graph)           │
+└────────┬────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────┐
+│ Personalized    │
+│ PageRank Ranker │  ←── Uses fused personalization
+│ (Project 2)     │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ Ranked Root     │
+│ Cause + Evidence │
+└─────────────────┘
+```
+
+## Understanding Checkpoints
+
+1. "Can I write a PromQL query for the P95 latency of any service from memory?" — If no, study PromQL more. This is the most complex query you'll write.
+2. "Can I explain why a CPU stress fault might NOT show up in trace-based analysis (Project 2)?" — Answer: CPU stress causes latency increases, but they may stay within the 2× P95 threshold. The anomaly is in the metric (CPU usage), not in the trace spans.
+3. "Can I explain why metric anomalies alone are insufficient for root cause analysis?" — Answer: When the database fails, ALL services show high latency. Metric-only analysis flags 8 services but can't tell which is the root cause. The dependency graph (from traces) provides the causal structure — telling you the database is upstream of all 8.
+4. "Does my fused scorer correctly rank the root cause #1 for both CPU stress (metric signal) and network latency (trace signal)?" — If no, your fusion weights need tuning.
+5. "Can I explain why the personalization vector in fused PageRank uses all three signals (trace, metric, graph)?" — Answer: Trace catches latency/error anomalies. Metric catches resource anomalies. Graph centrality identifies upstream sources. Together they cover all failure modes.
+
+## Common Mistakes
+
+1. **Using the incident window's own statistics for baselines.** If the anomaly is already happening, the current mean will be skewed high. ALWAYS compute baseline from the healthy window before the incident.
+2. **Querying counters directly without `rate()`.** Raw counter values are cumulative since process start — they're always increasing. You must use `rate()` or `increase()` for counters.
+3. **Forgetting the `by (le, ...)` grouping in `histogram_quantile()`.** Without `le`, the bucket boundaries get mixed across services, producing garbage percentiles.
+4. **Not handling missing data.** If a service has no data in the baseline window, report "insufficient baseline data" rather than producing NaN z-scores.
+5. **Not normalizing the personalization vector.** If fused scores sum to anything other than 1.0, PageRank produces silently wrong results. Always verify: `sum(personalization.values())` ≈ 1.0.
+6. **Hardcoding fusion weights.** α=0.4, β=0.4, γ=0.2 are starting points. Test against your fault injection suite and tune based on results. If you miss metric-only faults, increase β. If you miss trace-only faults, increase α.
+
+## Ship Criteria
+
+- [ ] Queries Prometheus for 4 key metrics per service (CPU, memory, latency, error rate) using correct PromQL patterns
+- [ ] Computes baseline statistics (mean, std, MAD) from sliding window
+- [ ] Detects anomalies using z-scores (configurable threshold) with MAD fallback
+- [ ] Optional PELT changepoint detection for onset times (`--detect-onset`)
+- [ ] Fuses trace Ochiai scores (Project 2) with metric anomaly scores using configurable weights (α, β, γ)
+- [ ] Runs Personalized PageRank with fused personalization vector
+- [ ] Reports evidence per service: trace score, metric z-scores, graph centrality, onset times
+- [ ] CLI with `analyze` and `metrics` commands
+- [ ] Python library API (`rca_detector.RCAEngine`)
+- [ ] JSON output for integration with Project 6 (Dashboard) and Project 7 (Benchmark)
+- [ ] README with PromQL query examples, fusion weight guidance, and setup instructions
+- [ ] Works with any Prometheus instance (not just Online Boutique)
+- [ ] Gracefully handles Prometheus downtime and missing data

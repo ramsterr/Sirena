@@ -11,6 +11,8 @@ requires-python = ">=3.10"
 dependencies = [
     "networkx>=3.0",
     "requests>=2.31.0",
+    "spectrum-scorer",
+    "trace-graph-visualizer",
 ]
 
 [project.scripts]

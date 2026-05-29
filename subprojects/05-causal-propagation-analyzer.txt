@@ -1,0 +1,390 @@
+# Project 5: Causal Propagation Analyzer — Build Reference
+
+> This document is the canonical reference for building a tool that detects when services became anomalous and determines which dependency edges actually transmitted the failure. It is a standalone, shippable project that contributes to Phase 3 of the SRE Root Cause Analysis Tool. Use this as the source of truth when prompting for implementation help. This project is an enhanced version of subproject #6 (Incident Timeline Generator).
+
+---
+
+## Meta-Structure: How to Read This Document
+
+This project contains these sections:
+
+- **Real Objective** — What you are *actually* trying to accomplish, stated in plain English.
+- **Tool Objective** — What the software must do at the end. This is the acceptance test.
+- **What You Must Understand Before Coding** — Concepts, their internals, and why they matter.
+- **What to Study and Where** — Specific resources, specific sections, specific things to extract.
+- **What to Code** — Each component, its purpose, inputs, outputs, internals, and verification.
+- **How the Pieces Connect** — Data flow showing how components connect.
+- **Understanding Checkpoints** — Concrete things you should be able to explain before moving on.
+- **Common Mistakes** — What people get wrong and how to avoid it.
+- **Ship Criteria** — What makes this project ready to publish and share.
+
+---
+
+## Real Objective
+
+Project 4 tells you "which services are anomalous." This project tells you "which service CAUSED the others to become anomalous." This is the difference between a symptom list and a diagnosis. When the database fails and 8 services show high latency, Project 4 gives you 8 suspicious services with similar fused scores. This project gives you 1 root cause and 7 victims, connected by a causal chain that explains exactly how the failure propagated.
+
+The key insight: the dependency graph (from Project 1) already encodes the structural constraint — "Service A *can* cause Service B if A calls B." During an incident, you only need to answer "Did it actually cause it THIS time?" You don't need to discover causality from scratch — you only need to PRUNE the dependency graph to the edges that were active during the incident, using two signals: temporal precedence (did A fail before B?) and cross-correlation (does A's metric shape predict B's metric shape with a time delay?).
+
+Neither assumes stationarity across the whole incident. Both work on the transient transition period.
+
+## Tool Objective
+
+By the end of this project, the tool must:
+1. Detect the exact time each service's key metric distribution shifted from normal to anomalous using PELT changepoint detection
+2. Use dual Pearson + Spearman cross-correlation lag analysis to determine which dependency edges were causally active
+3. Test all metric pairs per edge (CPU↔CPU, CPU↔latency, latency↔CPU, etc.) and report which pair carried the strongest signal
+4. Use per-edge lag windows (from Project 1) instead of a fixed global window
+5. Build a causal graph — a pruned subgraph of the dependency graph showing only causally active edges, labeled with confidence (high/low)
+6. Output a propagation path showing the chain of causation with timing evidence and metric-pair details at each step
+7. Output as structured JSON (for Project 6), markdown timeline, and HTML
+
+## What You Must Understand Before Coding
+
+### Concept 1: Anomaly Onset Detection via PELT Changepoint Detection
+
+Z-score thresholding (Project 4) compares individual points against a global baseline. PELT changepoint detection finds the moment the entire LOCAL distribution shifted — the mean, variance, or both change.
+
+**Why not z-score thresholding for onset?** During gradual failures (memory leaks, connection pool exhaustion), the z-score may not cross 3σ for minutes after the problem started. The threshold-crossing point is NOT the onset point — it's just when the anomaly became severe enough to trigger. PELT detects the onset at the beginning of the shift.
+
+```
+         Memory leak starts quietly
+         │
+T0 ──────T1──────────────────T2────────T3──────────────
+Normal    │  Leak begins          │   Z-score crosses 3σ
+          └─ PELT detects here ───┘── Z-score triggers here
+                                   (5 minutes late!)
+```
+
+**Implementation:**
+```python
+import ruptures as rpt
+
+def detect_onset(metric_series: np.ndarray,
+                 timestamps: np.ndarray,
+                 baseline_window: int = 60) -> datetime | None:
+    algo = rpt.Pelt(model="l2", min_size=3).fit(metric_series)
+    change_points = algo.predict(pen=10)
+    for cp in change_points:
+        if cp > baseline_window:
+            return timestamps[cp]
+    return None
+```
+
+For each service, detect onset across ALL metrics (CPU, memory, latency, error rate). The EARLIEST onset across all metrics is the service's anomaly onset time.
+
+**Self-check:** A memory leak starts at 02:12 and grows linearly. What time does PELT detect the onset vs z-score thresholding? Answer: PELT ~02:13 (1 minute after shift begins — needs a few points to confirm). Z-score ~02:18 (when memory crosses 3σ). PELT is 5 minutes more accurate.
+
+### Concept 2: Cross-Correlation Lag (Pearson + Spearman in Parallel)
+
+Instead of Granger causality (which assumes stationarity — fatal during incidents), you use cross-correlation to measure whether one time series' shape predicts another's with a time delay.
+
+```python
+from scipy.signal import correlate
+from scipy.stats import spearmanr
+
+def edge_is_causally_active(upstream: np.ndarray, downstream: np.ndarray,
+                            max_lag: int = 10) -> dict:
+    u = (upstream - upstream.mean()) / upstream.std()
+    d = (downstream - downstream.mean()) / downstream.std()
+
+    correlation = correlate(d, u, mode='full')
+    lags = np.arange(-len(u) + 1, len(d))
+
+    # Focus only on positive lags (upstream leads downstream)
+    pos_mask = lags > 0
+    pos_lags = lags[pos_mask]
+    pos_corr = correlation[pos_mask]
+
+    best_idx = np.argmax(pos_corr)
+    best_lag = pos_lags[best_idx]
+    pearson_corr = pos_corr[best_idx] / (len(u) * u.std() * d.std())
+
+    # Spearman at the best lag (catches non-linear monotonic)
+    if best_lag < len(u):
+        u_shifted = u[:-best_lag] if best_lag > 0 else u
+        d_shifted = d[best_lag:] if best_lag > 0 else d
+        min_len = min(len(u_shifted), len(d_shifted))
+        spearman_corr, _ = spearmanr(u_shifted[:min_len], d_shifted[:min_len])
+    else:
+        spearman_corr = 0.0
+
+    is_active = ((pearson_corr > 0.6) or (spearman_corr > 0.7)) and best_lag <= max_lag
+    return {
+        'is_active': is_active, 'lag_minutes': int(best_lag),
+        'pearson_corr': float(pearson_corr), 'spearman_corr': float(spearman_corr),
+    }
+```
+
+**Why TWO correlation measures?** Pearson catches linear shape similarity (DB CPU pulses → payment latency pulses with identical shape). Spearman catches monotonic non-linear (DB memory grows linearly → payment latency spikes erratically due to GC pauses. Both go up but shapes differ). Together they cover ~95% of propagation patterns.
+
+**Why 0.6 / 0.7 thresholds?** During testing, edges with true propagation show Pearson 0.7–0.95. Spurious edges show 0.1–0.4. Spearman uses 0.7 (stricter) because rank correlation produces higher baseline values.
+
+**Why this works during incidents:** You only look for relative lead-lag within a SHORT window (1–30 min). By z-scoring locally, absolute values don't matter — only shape. Cross-correlation finds the shape match regardless of whether the baseline was 10ms or 500ms.
+
+**Self-check:** DB CPU: `[10, 12, 11, 50, 55, 52, 48, 45]`. Payment latency: `[20, 22, 21, 23, 45, 55, 52, 50]`. What is the lag? Answer: DB spikes at index 3; payment spikes at index 5. Lag = 2 points. Edge `database → payment-service` is causally active. If each point = 1 minute, propagation delay is ~2 minutes.
+
+### Concept 3: All-Pairs Metric Cross-Correlation
+
+The "dominant metric" heuristic picks the single metric with the highest z-score per service. This can MISS cross-metric signals. Example: DB CPU spikes to 99%, but payment-service doesn't show CPU stress — it shows LATENCY spikes (waiting on slow DB queries). If payment's dominant metric happens to be error_rate (latency caused timeouts), pairing DB CPU with payment error_rate misses the real signal.
+
+**Solution: Run cross-correlation on ALL 4×4 = 16 metric pairs per edge and take the best:**
+
+```python
+def get_best_correlation(upstream_metrics: dict[str, np.ndarray],
+                         downstream_metrics: dict[str, np.ndarray],
+                         max_lag: int = 10) -> dict:
+    best = {'is_active': False, 'lag_minutes': 0, 'pearson_corr': 0.0,
+            'spearman_corr': 0.0, 'best_metric_pair': None}
+    for u_name, u_series in upstream_metrics.items():
+        for d_name, d_series in downstream_metrics.items():
+            result = edge_is_causally_active(u_series, d_series, max_lag)
+            combined = max(result['pearson_corr'], result['spearman_corr'])
+            if combined > max(best['pearson_corr'], best['spearman_corr']):
+                best = {**result, 'best_metric_pair': (u_name, d_name)}
+    return best
+```
+
+~800 correlation calls for 50 edges — trivial compute. Bonus: you learn *which metric pair* carried the signal ("DB CPU predicted payment latency with Pearson=0.89 at lag=2min").
+
+### Concept 4: Per-Edge Lag Windows from Trace Data
+
+A fixed `max_lag = 10 min` works for sync HTTP but misses async queue edges. Use per-edge windows from Project 1:
+- `frontend → cart-service` (P99 = 200ms) → 1 minute
+- `cart-service → email-service` (P99 = 120s, async) → 20 minutes
+
+The ×10 safety multiplier accounts for incident-time latency inflation. **Adaptive expansion fallback:** if no correlation within the trace-derived window, expand to 30 minutes. If found at 25 minutes, keep edge but downgrade to "low" confidence.
+
+### Concept 5: The Causal Graph vs. The Dependency Graph
+
+The **dependency graph** (Project 1) = "A CAN call B." The **causal graph** (this project) = "A's anomaly CAUSED B's anomaly in THIS incident."
+
+**Edge inclusion criteria:**
+
+| Temporal ✓ | Correlation ✓ | Result |
+|---|---|---|
+| Yes | Yes | **HIGH** confidence edge |
+| Yes | No | **LOW** confidence edge (propagated but noisy) |
+| No | N/A | **DROPPED** (no evidence) |
+
+**Why dropping edges is safe:** Dependency graph says "frontend can call database." But during a DB failure, the frontend didn't CAUSE the DB to fail. The causal graph should NOT have `frontend → database`. Dropping is exactly right.
+
+## What to Study and Where
+
+| What | Where | What to Extract |
+|---|---|---|
+| PELT changepoint detection | [ruptures docs](https://centre-borelli.github.io/ruptures-docs/) | `Pelt(model="l2")`, `.fit()`, `.predict(pen=10)`. `pen` tuning. |
+| Cross-correlation | [scipy.signal.correlate](https://docs.scipy.org/doc/scipy/reference/generated/scipy.signal.correlate.html) | `mode='full'`, lag index interpretation. |
+| Spearman correlation | [scipy.stats.spearmanr](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.spearmanr.html) | Monotonic vs linear relationships. |
+| NetworkX DiGraph | [NetworkX docs](https://networkx.org/documentation/stable/) | Edge attributes (`confidence`, `lag_minutes`, `pearson_corr`). |
+
+## What to Code
+
+### Component 5.1: Anomaly Onset Detector
+
+**Purpose:** Find the exact timestamp when each service became anomalous using PELT across all metrics.
+
+**Input:** Metric time series per service, baseline window size
+**Output:** Dictionary mapping `service_name → onset_datetime` (earliest across all metrics)
+
+```python
+def detect_service_onset(service_metrics: dict[str, MetricSeries],
+                         baseline_window_minutes: int = 60) -> datetime | None:
+    earliest_onset = None
+    for metric_name, series in service_metrics.items():
+        values = np.array(series.values)
+        timestamps = np.array(series.timestamps)
+        if len(values) < 10:
+            continue
+        algo = rpt.Pelt(model="l2", min_size=3).fit(values)
+        change_points = algo.predict(pen=10)
+        baseline_points = baseline_window_minutes
+        for cp in change_points:
+            if cp > baseline_points and cp < len(timestamps):
+                onset = timestamps[cp]
+                if earliest_onset is None or onset < earliest_onset:
+                    earliest_onset = onset
+                break
+    return earliest_onset
+```
+
+**How to verify:** Inject fault at known time → detected onset within ±2 min. Cascading failure → root cause has earliest onset.
+
+### Component 5.2: Cross-Correlation Lag Analyzer (All-Pairs)
+
+**Purpose:** Test whether upstream anomaly shape predicts downstream's with a time delay, across all metric pairs.
+
+**Input:** Two services' metric series, per-edge max lag window
+**Output:** Dict with `is_active`, `lag_minutes`, `pearson_corr`, `spearman_corr`, `best_metric_pair`
+
+Uses the `edge_is_causally_active()` and `get_best_correlation()` functions from Concepts 2 and 3. With adaptive expansion:
+
+```python
+def analyze_edge(u_metrics, v_metrics, max_lag_minutes, adaptive_expand=True):
+    result = get_best_correlation(u_metrics, v_metrics, int(max_lag_minutes))
+    if not result['is_active'] and adaptive_expand:
+        expanded = get_best_correlation(u_metrics, v_metrics, 30)
+        if expanded['is_active']:
+            return {**expanded, 'confidence': 'low',
+                    'note': f'Found at {expanded["lag_minutes"]}min lag (beyond {int(max_lag_minutes)}min window)'}
+    if result['is_active']:
+        result['confidence'] = 'high'
+    return result
+```
+
+**How to verify:** Inject fault in A → A→B active with positive lag; B→A NOT active. Sync edge: lag 1-3 min. Async edge: lag 5-25 min. `best_metric_pair` reflects mechanism.
+
+### Component 5.3: Causal Graph Builder
+
+**Purpose:** Build the causal graph from the dependency graph by pruning non-causal edges.
+
+**Input:** Dependency graph (Project 1), onset times, metric series, per-edge lag windows
+**Output:** Causal graph (NetworkX DiGraph with confidence-labeled edges)
+
+```python
+def build_causal_graph(dependency_graph, onsets, metric_series, edge_lag_windows):
+    causal = nx.DiGraph()
+    causal.add_nodes_from(dependency_graph.nodes())
+    for u, v in dependency_graph.edges():
+        u_onset = onsets.get(u); v_onset = onsets.get(v)
+        temporal_valid = (u_onset and v_onset and u_onset < v_onset)
+        if not temporal_valid:
+            continue  # drop edge
+        max_lag = edge_lag_windows.get((u, v), 10.0)
+        result = analyze_edge(metric_series[u], metric_series[v], max_lag)
+        if result.get('is_active') or temporal_valid:
+            causal.add_edge(u, v,
+                confidence=result.get('confidence', 'low'),
+                lag_minutes=result.get('lag_minutes'),
+                pearson_corr=result.get('pearson_corr'),
+                spearman_corr=result.get('spearman_corr'),
+                best_metric_pair=result.get('best_metric_pair'))
+    for node in causal.nodes():
+        if causal.in_degree(node) == 0:
+            causal.nodes[node]['is_root_candidate'] = True
+    return causal
+```
+
+**How to verify:** Inject DB failure → star-shaped graph centered on DB, no edges INTO DB. Inject cart-service → cart→(downstreams), no edge `frontend → cart-service`. For HIGH edges, verify `best_metric_pair`.
+
+### Component 5.4: Propagation Path Generator
+
+**Purpose:** BFS through causal graph to produce human-readable propagation tree.
+
+**Input:** Causal graph, onset times
+**Output:** List of `PropagationStep` with service, onset, delay, confidence, metric-pair evidence, children
+
+Steps are BFS from root cause(s). Root cause = nodes with 0 incoming edges. Each step records: service name, onset time, delay from parent (None for root), confidence, Pearson/Spearman, best_metric_pair, children list.
+
+### Component 5.5: Output Formatters
+
+**Purpose:** Render causal graph and propagation path in JSON, markdown, and HTML.
+
+**JSON (for Project 6):**
+```json
+{
+  "incident_time": "2026-05-26T02:14:00Z",
+  "root_cause_candidates": ["database"],
+  "propagation_path": [
+    {"service": "database", "onset": "02:12:17", "delay": null, "is_root": true,
+     "children": ["payment-service"]},
+    {"service": "payment-service", "onset": "02:14:03", "delay": "1m46s",
+     "confidence": "high", "pearson_corr": 0.89,
+     "best_metric_pair": ["cpu", "latency"], "children": ["cart-service"]}
+  ]
+}
+```
+
+**Markdown:**
+```markdown
+# Incident Causal Timeline
+
+Root cause: **database** (onset: 02:12:17)
+
+| # | Service | Onset | Delay | Confidence | Evidence |
+|---|---------|-------|-------|------------|----------|
+| 1 | **database** | 02:12:17 | — | — | Earliest anomaly |
+| 2 | payment-service | 02:14:03 | +1m46s | HIGH | Pearson=0.89 (cpu→latency) |
+| 3 | cart-service | 02:15:12 | +1m09s | HIGH | Spearman=0.82 (latency→error) |
+| 4 | frontend | 02:16:01 | +0m49s | HIGH | Pearson=0.91 (error→error) |
+```
+
+### Component 5.6: CLI Interface
+
+```bash
+# Generate causal timeline from raw metric data
+causal-trace analyze --metrics metrics.json --graph graph.json \
+    --lag-windows lag_windows.json --baseline-window 60
+
+# From pre-computed onsets
+causal-trace analyze --onsets onsets.json --graph graph.json
+
+# Output as markdown
+causal-trace analyze --metrics metrics.json --graph graph.json --format markdown
+
+# Output as JSON for Project 6
+causal-trace analyze --metrics metrics.json --graph graph.json \
+    --format json --output causal.json
+
+# Validate causality with cross-correlation (default: on)
+causal-trace analyze --metrics metrics.json --graph graph.json --no-validate
+```
+
+## How the Pieces Connect
+
+```
+Metric Time Series (Project 4)    Dependency Graph (Project 1)
+         │                                    │
+    ┌────┴──────────┐              ┌──────────┴──────────┐
+    ▼               ▼              ▼                     ▼
+┌─────────────┐ ┌──────────────┐ ┌─────────────────┐ ┌──────────────┐
+│ Onset       │ │ All-Pairs    │ │ Dependency Graph│ │ Per-Edge Lag │
+│ Detector    │ │ Cross-Corr   │ │ (structural     │ │ Windows      │
+│ (PELT, 5.1) │ │ Analyzer(5.2)│ │  prior)         │ │ (from Proj.1)│
+└──────┬──────┘ └──────┬───────┘ └────────┬────────┘ └──────┬───────┘
+       │               │                  │                  │
+       ▼               ▼                  ▼                  ▼
+┌────────────────────────────────────────────────────────────────┐
+│ Causal Graph Builder (5.3)                                     │
+│ Prunes dependency graph → causal graph with confidence labels  │
+└──────────────────────────────┬─────────────────────────────────┘
+                               │
+                          ┌────┴────┐
+                          ▼         ▼
+                    ┌──────────┐ ┌────────────────┐
+                    │Propagation│ │Output Formatters│
+                    │Path (5.4) │ │(5.5) JSON/MD/  │
+                    │          │ │     HTML        │
+                    └──────────┘ └────────────────┘
+```
+
+## Understanding Checkpoints
+
+1. "Can I explain why PELT is better than z-score thresholding for onset detection?" — PELT detects distribution shifts; z-scores detect individual point crossings. For gradual failures, PELT finds onset 5+ minutes earlier.
+2. "Can I explain why we run both Pearson and Spearman?" — Pearson catches linear shape matches. Spearman catches monotonic non-linear. Together ~95% coverage.
+3. "Can I explain why all-pairs is better than dominant-metric?" — Cross-metric propagation (DB CPU → payment latency) is missed if each service's dominant metric is picked in isolation.
+4. "If DB fails first and payment fails 2 min later but metrics DON'T correlate (Pearson<0.6 AND Spearman<0.7), what does the causal graph show?" — Keep a LOW-confidence edge. Temporal precedence is satisfied. The weak correlation suggests noisy, async, or non-linear/non-monotonic propagation.
+5. "Does my causal graph correctly trace propagation for at least 3 fault types?" — If no, debug onset detection and cross-correlation thresholds.
+
+## Common Mistakes
+
+1. **Using z-score threshold crossing for onset detection.** Z-scores are brittle for gradual anomalies. Always use PELT.
+2. **Using only Pearson and missing non-linear propagation.** Always run Spearman in parallel.
+3. **Using a fixed global lag window.** Sync edges need ~1 min; async need 15-30 min. Use per-edge windows from Project 1.
+4. **Not handling missing onset times.** Services that never became anomalous should be excluded, not included with None onset.
+5. **Running cross-correlation on the full incident window.** Use a short window around the transition period. The full window includes stable pre/post-incident periods that dilute the signal.
+6. **Not timezone-normalizing timestamps.** If some are UTC and others local, sorting is wrong. Normalize to UTC.
+
+## Ship Criteria
+
+- [ ] PELT changepoint detection for anomaly onset times across all metrics
+- [ ] Dual Pearson + Spearman cross-correlation per edge
+- [ ] All-pairs metric cross-correlation (4×4 per edge) with `best_metric_pair` reporting
+- [ ] Per-edge lag windows from Project 1 trace data (P99 × 10 safety)
+- [ ] Adaptive expansion fallback (30 min) when trace-derived window is too short
+- [ ] Causal graph construction with HIGH/LOW confidence edges
+- [ ] BFS propagation path from root cause to all victims
+- [ ] JSON, markdown, and HTML output
+- [ ] CLI with `analyze` command
+- [ ] README with example inputs/outputs and concept explanations
+- [ ] pip-installable
